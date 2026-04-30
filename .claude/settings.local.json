@@ -1,0 +1,21 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(node -e ' *)",
+      "Read(//private/tmp/tcog_inspect/**)",
+      "Bash(unzip -o -q /Users/zero/Library/CloudStorage/OneDrive-Personal/Work/TCognitiveProject/code/packages/tcog_field_basis_packages_v0_3_7.zip \"tcog_field_basis_packages_v0_3_7/economics_core/manifest.json\" \"tcog_field_basis_packages_v0_3_7/philosophy_ethics_core/manifest.json\" \"tcog_field_basis_packages_v0_3_7/economics_core/clusters.jsonl\" \"tcog_field_basis_packages_v0_3_7/philosophy_ethics_core/clusters.jsonl\")",
+      "Bash(python3 -c ' *)",
+      "Bash(python3 verify_pipeline.py)",
+      "Bash(unzip -o -q /Users/zero/Library/CloudStorage/OneDrive-Personal/Work/TCognitiveProject/code/packages/tcog_field_basis_packages_v0_3_7.zip \"tcog_field_basis_packages_v0_3_7/psychology_core/clusters.jsonl\" \"tcog_field_basis_packages_v0_3_7/counselling_practice_core/clusters.jsonl\")",
+      "Bash(python3 -m http.server 8765)",
+      "Bash(echo \"server PID: $!\")",
+      "Bash(curl -sS -o /dev/null -w \"demo HTTP: %{http_code}\\\\n\" http://localhost:8765/tcog_demo.html)",
+      "Bash(curl -sS -o /dev/null -w \"bundle HTTP: %{http_code}\\\\n\" http://localhost:8765/packages/tcog_field_basis_packages_v0_3_7.zip)",
+      "Bash(osascript -e 'tell application \"Google Chrome\" to make new window' -e 'tell application \"Google Chrome\" to set URL of active tab of front window to \"http://localhost:8765/tcog_demo.html\"')",
+      "Bash(osascript -e 'tell application \"Google Chrome\" to execute active tab of front window javascript \"JSON.stringify\\({url: location.href, packages: LOADED_PACKAGES.map\\(p => p.manifest.package_id\\), patches: LOADED_PACKAGES.filter\\(p => p._patched\\).map\\(p => p.manifest.package_id\\)}\\)\"')",
+      "Bash(curl -sS http://localhost:8765/tcog_demo.html)",
+      "Bash(kill 39684)",
+      "Bash(rm -f /tmp/tcog_server.log)"
+    ]
+  }
+}
