@@ -1764,16 +1764,68 @@ function assignFrameRoles(sentence, trace) {
   };
 }
 
+function detectPrimaryDomain(sentence, trace) {
+  const roles = trace.frame_roles || assignFrameRoles(sentence, trace);
+  if (roles.primary_frame && roles.primary_frame.role === 'primary_domain') return roles.primary_frame;
+  const activePrimary = (roles.primary_frames || []).find(f => f.cue_matches && f.cue_matches.length > 0);
+  if (activePrimary) return activePrimary;
+  const gap = (trace.domain_coverage_gaps || [])[0];
+  if (gap) {
+    return {
+      package_id: gap.package_id,
+      domain: gap.domain || '',
+      role: 'primary_domain',
+      cue_matches: gap.matched_tokens || [],
+      coverage_gap: true
+    };
+  }
+  return null;
+}
+
+function hasPrimaryDomainSupport(sentence, trace) {
+  const primary = detectPrimaryDomain(sentence, trace);
+  if (!primary || primary.coverage_gap) return false;
+  const hasCluster = (trace.activated_clusters || []).some(a => a.package_id === primary.package_id);
+  const hasUnit = (trace.units || []).some(u => unitPackageId(u) === primary.package_id);
+  return hasCluster || hasUnit;
+}
+
+function hasCoverageGap(sentence, trace) {
+  const primary = detectPrimaryDomain(sentence, trace);
+  return !!primary && !hasPrimaryDomainSupport(sentence, trace);
+}
+
+function isTrueFrameMisalignment(sentence, trace) {
+  if (hasPrimaryDomainSupport(sentence, trace)) return false;
+  const activeRoles = trace.frame_roles || assignFrameRoles(sentence, trace);
+  const onlyChecker = (activeRoles.considered_frames || []).length > 0 &&
+    (activeRoles.considered_frames || []).every(f => f.role === 'auxiliary_checker' || f.role === 'method_frame');
+  if (onlyChecker && detectPrimaryDomain(sentence, trace)) return false;
+
+  const sentNorm = normalize(sentence);
+  const suppressedPrimaryUse = (trace.suppressed_packages || [])
+    .filter(s => s.reason === 'suppressed_due_to_overreach')
+    .some(suppressed => {
+      const pkg = LOADED_PACKAGES.find(p => p.manifest.package_id === suppressed.package_id);
+      if (!pkg || getPackageRole(sentence, pkg) !== 'primary_domain') return false;
+      const matches = packageDomainVocabulary(pkg, suppressed).filter(v => phraseMatchInQuery(v, sentNorm));
+      return matches.length >= 3;
+    });
+  if (suppressedPrimaryUse) return true;
+
+  return (trace.frame_issues || []).some(i => i.kind === 'conflict' || i.kind === 'frame_limit');
+}
+
 function classifyClaimSentence(sentence, trace) {
   const blocking = (trace.triggered_constraints || []).filter(t => t.constraint.blocks_answer);
   const units = trace.units || [];
   const clusters = trace.activated_clusters || [];
   const multiFrame = (trace.active_packages || []).length > 1;
   const hasConstraints = (trace.triggered_constraints || []).length > 0;
-  const misframed = traceHasSuppressedVocabulary(sentence, trace);
 
   if (blocking.length > 0) return 'BLOCKED';
-  if (misframed) return 'MISFRAMED';
+  if (hasCoverageGap(sentence, trace)) return 'COVERAGE_GAP';
+  if (isTrueFrameMisalignment(sentence, trace)) return 'MISFRAMED';
   if (units.length > 0 && (hasConstraints || multiFrame)) return 'PARTIAL';
   if (units.length >= 2 && clusters.length > 0) return 'SOLID';
   if (units.length > 0 || clusters.length > 0) return 'FRAGILE';
@@ -1783,8 +1835,9 @@ function classifyClaimSentence(sentence, trace) {
 
 function appraiseClaimSentence(sentence) {
   const trace = retrieve(sentence);
-  const verdict = classifyClaimSentence(sentence, trace);
   const frame_roles = assignFrameRoles(sentence, trace);
+  trace.frame_roles = frame_roles;
+  const verdict = classifyClaimSentence(sentence, trace);
   return {
     sentence,
     trace,
@@ -1810,6 +1863,7 @@ function suggestedClaimRepair(verdict, trace) {
       .filter(Boolean);
     return repairs.length ? repairs.join(' ') : 'Convert the direct claim into a repair question before answering.';
   }
+  if (verdict === 'COVERAGE_GAP') return 'Treat this as a package coverage issue: load or author a package cluster/unit for the relevant domain before making a stronger package-supported claim.';
   if (verdict === 'MISFRAMED') return 'Separate the claim by frame and remove vocabulary from suppressed packages unless explicitly marked as excluded.';
   if (verdict === 'PARTIAL') return 'Surface the triggered constraint or multi-frame conflict before making the claim.';
   if (verdict === 'FRAGILE') return 'Soften the claim and cite package units only for the supported part.';
@@ -1821,6 +1875,7 @@ function aggregateSolidityVerdict(claims) {
   const verdicts = claims.map(c => c.verdict);
   if (verdicts.includes('BLOCKED')) return 'BLOCKED';
   if (verdicts.includes('MISFRAMED')) return 'MISFRAMED';
+  if (verdicts.includes('COVERAGE_GAP')) return 'COVERAGE_GAP';
   if (claims.length > 0 && verdicts.every(v => v === 'SOLID')) return 'SOLID';
   if (verdicts.includes('PARTIAL') || verdicts.includes('SOLID') || verdicts.includes('FRAGILE')) return 'PARTIAL';
   return 'UNSUPPORTED';
@@ -1835,7 +1890,7 @@ function appraiseClaimSolidity(text) {
 
   const supportedCount = claims.filter(c => c.verdict === 'SOLID' || c.verdict === 'PARTIAL').length;
   const constraintCount = claims.filter(c => c.triggered_constraints.length > 0).length;
-  const frameCount = claims.filter(c => c.verdict === 'MISFRAMED' || (c.trace.active_packages || []).length > 1).length;
+  const frameCount = claims.filter(c => c.verdict === 'MISFRAMED' || c.verdict === 'COVERAGE_GAP' || (c.trace.active_packages || []).length > 1).length;
   const primaryFrames = [...new Set(claims.map(c => c.primary_frame?.package_id).filter(Boolean))];
   const constraintFrames = [...new Set(claims.flatMap(c => c.constraint_frames || []).map(f => f.package_id))];
   const suppressedFrames = [...new Set(claims.flatMap(c => c.suppressed_frames || []).map(f => f.package_id))];
@@ -1865,8 +1920,9 @@ function appraiseClaimSolidity(text) {
 function verdictClassLabel(verdict) {
   return {
     SOLID: 'Package-supported',
-    PARTIAL: 'Constraint-triggered',
-    FRAGILE: 'Package-supported, fragile',
+    PARTIAL: 'Partial / needs caveat',
+    FRAGILE: 'Partial / needs caveat',
+    COVERAGE_GAP: 'Coverage gap',
     MISFRAMED: 'Frame-misaligned',
     UNSUPPORTED: 'Unsupported',
     BLOCKED: 'Blocked'
@@ -1880,6 +1936,16 @@ function frameLabel(frame) {
 
 function frameListLabel(frames) {
   return frames && frames.length ? frames.map(frameLabel).join(', ') : 'none';
+}
+
+function verdictExplanation(verdict) {
+  if (verdict === 'COVERAGE_GAP') {
+    return 'The text appears to belong to a domain frame, but the loaded packages did not provide enough matching clusters or units. This is a package coverage issue, not necessarily a problem with the claim.';
+  }
+  if (verdict === 'MISFRAMED') {
+    return 'The text appears to use a frame that does not fit the claim, or it collapses incompatible frames.';
+  }
+  return '';
 }
 
 function renderFrameRoleSummary(appraisal) {
@@ -1920,7 +1986,7 @@ function renderSolidityAppraisal(appraisal, repairedText = null) {
         <td>${escapeHtml(diagnosticValue(c.active_packages))}</td>
         <td>${escapeHtml(diagnosticValue(c.active_clusters.map(shortClusterId)))}</td>
         <td>${escapeHtml(diagnosticValue(c.triggered_constraints))}</td>
-        <td><span class="verdict-pill">${escapeHtml(verdictClassLabel(c.verdict))}</span></td>
+        <td><span class="verdict-pill">${escapeHtml(verdictClassLabel(c.verdict))}</span>${verdictExplanation(c.verdict) ? `<div style="font-size:12px; color:var(--ink-soft); margin-top:4px;">${escapeHtml(verdictExplanation(c.verdict))}</div>` : ''}</td>
         <td>${escapeHtml(c.suggested_repair)}</td>
       </tr>
     `).join('')
@@ -3079,6 +3145,12 @@ const SCENARIOS = [
         query: 'Every rock must fall from above to below because of the gravity.',
         requires: ['physics_dynamical_constraints_core', 'math_proof_core'],
         watch: 'physics_dynamical_constraints_core should be primary or surface a domain_detected_no_cluster gap. math_proof_core may appear only as an auxiliary universal-claim checker; statistics_core should not dominate.'
+      },
+      {
+        label: 'near-Earth rock: not frame-misaligned',
+        query: 'Under ordinary near-Earth conditions, an unsupported rock accelerates downward relative to the local gravitational field.',
+        requires: ['physics_dynamical_constraints_core'],
+        watch: 'Claim Solidity Appraisal should not label this Frame-misaligned. With physics support it should be Package-supported or Partial / needs caveat; without support it should be Coverage gap.'
       }
     ]
   },
