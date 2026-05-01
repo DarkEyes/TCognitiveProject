@@ -126,6 +126,70 @@ const PACKAGE_PATCHES = {
   }
 };
 
+const PHYSICS_GRAVITY_TOKENS = [
+  'gravity', 'gravitational', 'fall', 'falling', 'downward', 'above',
+  'below', 'unsupported object', 'acceleration', 'local gravitational field',
+  'near earth', 'near-earth', 'motion', 'force', 'mass'
+];
+
+function ensureArrayUnique(arr, values) {
+  for (const value of values) {
+    if (!arr.some(existing => normalize(existing) === normalize(value))) arr.push(value);
+  }
+}
+
+function applyPackageIntegrationPatch(pkg) {
+  const id = pkg.manifest && pkg.manifest.package_id;
+  if (!id) return;
+
+  if (id !== 'physics_dynamical_constraints_core') return;
+  const policy = pkg.manifest.activation_policy || (pkg.manifest.activation_policy = {});
+  policy.strict_domain_tokens = policy.strict_domain_tokens || pkg.manifest.strict_domain_tokens || [];
+  ensureArrayUnique(policy.strict_domain_tokens, PHYSICS_GRAVITY_TOKENS);
+  policy.activate_when = policy.activate_when || [];
+  ensureArrayUnique(policy.activate_when, PHYSICS_GRAVITY_TOKENS);
+
+  const unitId = `${id}:u_local_gravity_scope`;
+  if (!pkg.units.some(u => u.id === unitId)) {
+    pkg.units.push({
+      id: unitId,
+      label: 'Local gravitational acceleration and scope',
+      definition: 'Near Earth, an unsupported object accelerates relative to the local gravitational field; claims about falling require scope conditions such as reference frame, support, and local field.',
+      status: 'draft',
+      anchors: [{
+        source_id: `${id}:package_authored_axiom`,
+        location: 'package-authored draft unit',
+        excerpt: 'Near-Earth falling claims require local gravitational field, support, and reference-frame scope.'
+      }]
+    });
+  }
+
+  const clusterId = `${id}:k_falling_under_gravity`;
+  if (!pkg.clusters.some(c => c.id === clusterId)) {
+    pkg.clusters.push({
+      id: clusterId,
+      label: 'falling under gravity / local gravitational field',
+      description: 'Frames claims about falling, gravity, downward motion, unsupported objects, and local gravitational fields.',
+      cues: PHYSICS_GRAVITY_TOKENS.slice(),
+      members: [unitId]
+    });
+  }
+
+  const constraintId = `${id}:c_scope_physical_universal_claims`;
+  if (!pkg.constraints.some(c => c.id === constraintId)) {
+    pkg.constraints.push({
+      id: constraintId,
+      label: 'physical universal claims require scope',
+      rule: 'Unrestricted physical universal claims require scope conditions such as reference frame, support conditions, and local gravitational field.',
+      repair: 'Specify the reference frame, whether the object is unsupported, and the local gravitational field or environment.',
+      severity: 'medium',
+      blocks_answer: false,
+      trigger_cues: ['every', 'must', 'always', 'all', 'gravity', 'fall', 'falling'],
+      related_clusters: [clusterId]
+    });
+  }
+}
+
 function getPackageAuthoredStrictDomainTokens(pkg) {
   const manifest = pkg.manifest || {};
   const policyTokens = manifest.activation_policy && manifest.activation_policy.strict_domain_tokens;
@@ -137,6 +201,29 @@ function getPackageAuthoredStrictDomainTokens(pkg) {
 
 function getStrictDomainTokens(pkg) {
   return getPackageAuthoredStrictDomainTokens(pkg) || pkg._strict_domain_tokens || [];
+}
+
+function queryIsNormativeOrEthical(query) {
+  return query && /\b(should|ought|moral|morally|ethical|ethics|fair|fairness|justice|right|wrong|value|values|legitimate|good|bad)\b/i.test(query);
+}
+
+function getPackageRole(query, pkg) {
+  const role = pkg.manifest && pkg.manifest.package_role;
+  const allowed = new Set(['primary_domain', 'auxiliary_checker', 'safety_gate', 'method_frame', 'unknown']);
+  if (allowed.has(role)) return role;
+
+  const id = pkg.manifest?.package_id || '';
+  if (id === 'math_proof_core') return 'auxiliary_checker';
+  if (id === 'statistics_core') return 'auxiliary_checker';
+  if (id === 'philosophy_ethics_core') return queryIsNormativeOrEthical(query) ? 'primary_domain' : 'auxiliary_checker';
+  if (id === 'physics_dynamical_constraints_core') return 'primary_domain';
+  if (id === 'chemistry_interactions_core') return 'primary_domain';
+  if (id === 'economics_core') return 'primary_domain';
+  if (id === 'medicine_diagnostic_safety_core') return 'safety_gate';
+  if (id === 'counselling_practice_core') return 'safety_gate';
+  if (id === 'law_practice_core') return 'primary_domain';
+  if (/\b(method|proof|logic|statistics|statistical|probability|epistemic)\b/i.test(id)) return 'method_frame';
+  return 'primary_domain';
 }
 
 function applyPackagePatch(pkg) {
@@ -451,7 +538,9 @@ function retrieve(query) {
     matched_trajectories: [],    // top trajectory matches across packages
     frame_issues: [],            // frame issues across packages
     active_packages: [],         // packages that contributed clusters
-    suppressed_packages: []      // packages mechanically suppressed (avoid / overreach)
+    suppressed_packages: [],     // packages mechanically suppressed (avoid / overreach)
+    domain_coverage_gaps: [],    // primary-domain tokens matched but no clusters fired
+    frame_roles: null            // assigned after activation, before rendering
   };
 
   if (LOADED_PACKAGES.length === 0) {
@@ -502,9 +591,23 @@ function retrieve(query) {
       continue;
     }
     const activated = activateClustersInPackage(query, pkg, routing);
+    if (activated.length === 0 && gate.matched.length > 0 && getPackageRole(query, pkg) === 'primary_domain') {
+      trace.domain_coverage_gaps.push({
+        package_id: pkg.manifest.package_id,
+        domain: pkg.manifest.domain || '',
+        matched_tokens: gate.matched,
+        reason: 'domain_detected_no_cluster',
+        detail: `The query appears to involve ${pkg.manifest.domain || pkg.manifest.package_id}, but no ${pkg.manifest.package_id} cluster matched mechanically.`
+      });
+    }
     for (const a of activated) {
       a.package_id = pkg.manifest.package_id;
       a.package = pkg;
+      const domainBonus = getPackageRole(query, pkg) === 'primary_domain' && gate.matched.length > 0 ? 2 : 0;
+      if (domainBonus) {
+        a.frame_bonus = domainBonus;
+        a.score += domainBonus;
+      }
       allActivated.push(a);
     }
   }
@@ -560,16 +663,24 @@ function retrieve(query) {
     });
   }
 
+  trace.frame_roles = assignFrameRoles(query, trace);
+  trace.units = orderUnitsByFrameRole(trace.units, trace);
+
   // Determine response disposition
   const blocking = trace.triggered_constraints.filter(t => t.constraint.blocks_answer);
   const allAvoided = trace.routing_per_package.length > 0 &&
                      trace.routing_per_package.every(r => r.classification === 'avoid');
   const noClusters = trace.activated_clusters.length === 0;
 
+  const onlyAuxiliary = trace.active_packages.length > 0 &&
+    trace.active_packages.every(p => getPackageRole(query, p) === 'auxiliary_checker' || getPackageRole(query, p) === 'method_frame');
+
   if (allAvoided) {
     trace.disposition = 'refuse_out_of_frame';
   } else if (noClusters) {
     trace.disposition = 'no_match';
+  } else if (onlyAuxiliary) {
+    trace.disposition = 'auxiliary_only';
   } else if (blocking.length > 0) {
     trace.disposition = 'partial_with_blocking_constraints';
   } else {
@@ -593,6 +704,43 @@ function unitsToCitedSentences(units, maxUnits = 8) {
   });
 }
 
+function unitPackageId(unit) {
+  return String(unit.id || '').split(':')[0];
+}
+
+function orderUnitsByFrameRole(units, trace) {
+  const roles = trace.frame_roles || {};
+  const primary = new Set((roles.primary_frames || []).map(f => f.package_id));
+  const safety = new Set((roles.safety_frames || []).map(f => f.package_id));
+  const auxiliary = new Set((roles.auxiliary_frames || []).map(f => f.package_id));
+  return (units || []).slice().sort((a, b) => {
+    const rank = (u) => {
+      const pkg = unitPackageId(u);
+      if (primary.has(pkg)) return 0;
+      if (safety.has(pkg)) return 1;
+      if (auxiliary.has(pkg)) return 3;
+      return 2;
+    };
+    return rank(a) - rank(b);
+  });
+}
+
+function detectDomainCoverageGaps(trace) {
+  return trace.domain_coverage_gaps || [];
+}
+
+function friendlyFrameRoleSummary(trace) {
+  const roles = trace.frame_roles || {};
+  const list = (items) => items && items.length ? items.map(f => f.package_id).join(', ') : 'none';
+  return {
+    primary: list(roles.primary_frames || []),
+    auxiliary: list(roles.auxiliary_frames || []),
+    safety: list(roles.safety_frames || []),
+    suppressed: list(roles.suppressed_frames || []),
+    gaps: detectDomainCoverageGaps(trace)
+  };
+}
+
 function buildRawResponse(query, trace) {
   if (trace.disposition === 'no_packages_loaded') {
     return {
@@ -613,6 +761,8 @@ function buildRawResponse(query, trace) {
       cluster_count: trace.activated_clusters.filter(a => a.package_id === p.manifest.package_id).length
     })),
     suppressed_packages: trace.suppressed_packages || [],
+    frame_roles: trace.frame_roles || null,
+    domain_coverage_gaps: detectDomainCoverageGaps(trace),
     activated_clusters: trace.activated_clusters.map(a => ({
       id: a.cluster.id,
       label: a.cluster.label,
@@ -651,10 +801,17 @@ function buildRawResponse(query, trace) {
     const detail = avoided.map(a => `${a.package_id} (avoid: ${a.avoid_matches.join(', ')})`).join('; ');
     sections.sectionB_note = `All loaded packages declared <code>avoid_when</code> matches for this query: ${detail}. No package-bound claims are available from the current package set. Loading a package covering this domain would let TCog provide a grounded answer.`;
   } else if (trace.disposition === 'no_match') {
-    const pkgIds = LOADED_PACKAGES.map(p => p.manifest.package_id).join(', ');
-    sections.sectionB_note = `No clusters in any loaded package (${pkgIds}) matched terms in this query above the activation threshold. No package-bound claims are available from the current package set.`;
+    const gaps = detectDomainCoverageGaps(trace);
+    if (gaps.length > 0) {
+      sections.sectionB_note = gaps.map(g => escapeHtml(g.detail)).join(' ');
+    } else {
+      const pkgIds = LOADED_PACKAGES.map(p => p.manifest.package_id).join(', ');
+      sections.sectionB_note = `No clusters in any loaded package (${pkgIds}) matched terms in this query above the activation threshold. No package-bound claims are available from the current package set.`;
+    }
+  } else if (trace.disposition === 'auxiliary_only') {
+    sections.sectionB_note = `Only generic checker frames activated. TCog-R did not find a primary domain frame for this query.`;
   } else {
-    sections.sectionB_units = unitsToCitedSentences(trace.units);
+    sections.sectionB_units = unitsToCitedSentences(orderUnitsByFrameRole(trace.units, trace));
   }
 
   // ---------- Section C: constraints / repairs ----------
@@ -1562,12 +1719,15 @@ function frameCandidateScore(sentence, trace, pkg) {
     .filter(a => a.package_id === pkgId)
     .reduce((sum, a) => sum + (a.score || 0), 0);
   const unitCount = (trace.units || []).filter(u => String(u.id || '').startsWith(`${pkgId}:`)).length;
-  const genericPenalty = isGenericFramePackage(pkg) ? 3 : 0;
+  const role = getPackageRole(sentence, pkg);
+  const genericPenalty = role === 'auxiliary_checker' || role === 'method_frame' || isGenericFramePackage(pkg) ? 5 : 0;
+  const primaryBonus = role === 'primary_domain' && cueMatches.length > 0 ? 6 : 0;
   return {
     package_id: pkgId,
     domain: pkg.manifest.domain || '',
+    role,
     cue_matches: cueMatches,
-    score: cueMatches.length * 4 + clusterScore + unitCount - genericPenalty,
+    score: cueMatches.length * 4 + clusterScore + unitCount + primaryBonus - genericPenalty,
     is_generic: isGenericFramePackage(pkg)
   };
 }
@@ -1575,17 +1735,21 @@ function frameCandidateScore(sentence, trace, pkg) {
 function assignFrameRoles(sentence, trace) {
   const active = (trace.active_packages || []).map(pkg => frameCandidateScore(sentence, trace, pkg));
   const domainSpecific = active
-    .filter(f => !f.is_generic && f.cue_matches.length > 0)
+    .filter(f => f.role === 'primary_domain' && f.cue_matches.length > 0)
     .sort((a, b) => b.score - a.score);
   const ranked = active.slice().sort((a, b) => b.score - a.score);
   const primary = domainSpecific[0] || ranked[0] || null;
   const primaryId = primary ? primary.package_id : null;
   const constraintIds = new Set((trace.triggered_constraints || []).map(t => t.package_id));
-  const suppressedIds = new Set((trace.suppressed_packages || []).map(s => s.package_id));
+  const primaryFrames = ranked.filter(f => f.role === 'primary_domain');
+  const auxiliaryFrames = ranked.filter(f => f.role === 'auxiliary_checker' || f.role === 'method_frame');
+  const safetyFrames = ranked.filter(f => f.role === 'safety_gate');
 
   return {
     primary_frame: primary,
-    auxiliary_frames: ranked.filter(f => f.package_id !== primaryId && !constraintIds.has(f.package_id)),
+    primary_frames: primaryFrames,
+    auxiliary_frames: auxiliaryFrames.filter(f => f.package_id !== primaryId),
+    safety_frames: safetyFrames,
     constraint_frames: ranked.filter(f => constraintIds.has(f.package_id)),
     suppressed_frames: (trace.suppressed_packages || []).map(s => ({
       package_id: s.package_id,
@@ -2137,6 +2301,7 @@ function friendlyDisposition(disposition) {
   return {
     partial_with_blocking_constraints: 'Answer blocked until value tradeoff is surfaced',
     normal_answer: 'Package-grounded answer available',
+    auxiliary_only: 'Only checker frames activated',
     refuse_out_of_frame: 'Outside loaded package scope',
     no_match: 'No loaded package matched',
     no_packages_loaded: 'No packages loaded'
@@ -2195,7 +2360,26 @@ function buildAnswerSummary(query, trace, sections) {
     };
   }
 
+  if (trace.disposition === 'auxiliary_only') {
+    return {
+      text: 'Only generic checker frames activated. TCog-R did not find a primary domain frame for this query.',
+      why: [
+        'Auxiliary checker packages can flag proof, quantifier, or uncertainty issues.',
+        'A complete package-bound answer requires a primary domain frame or a package coverage gap.'
+      ],
+      next: 'Load or patch a primary domain package for this topic, or rephrase with domain-specific terms.'
+    };
+  }
+
   if (trace.disposition === 'no_match') {
+    const gaps = detectDomainCoverageGaps(trace);
+    if (gaps.length > 0) {
+      return {
+        text: gaps[0].detail,
+        why: ['A primary domain frame was detected by strict domain tokens, but no cluster passed the mechanical activation threshold.'],
+        next: 'Patch or load a package cluster covering this domain-specific claim before treating checker-frame output as complete.'
+      };
+    }
     return {
       text: 'TCog did not find a loaded package frame that matches this query closely enough to provide package-bound claims.',
       why: ['No clusters passed the mechanical activation threshold.'],
@@ -2208,6 +2392,29 @@ function buildAnswerSummary(query, trace, sections) {
     why: ['No package-bound answer is available from the current state.'],
     next: 'Load packages, then run the query again.'
   };
+}
+
+function renderFrameRolesCard(trace) {
+  const summary = friendlyFrameRoleSummary(trace);
+  const gaps = summary.gaps || [];
+  const gapHtml = gaps.length
+    ? '<ul class="trace-list">' + gaps.map(g =>
+        `<li><code>${escapeHtml(g.package_id)}</code> <span class="status-pill" style="background:rgba(184,92,0,0.10); color:var(--warn);">domain_detected_no_cluster</span><div style="font-size:12px; color:var(--ink-soft); margin-top:2px;">${escapeHtml(g.detail)}</div></li>`
+      ).join('') + '</ul>'
+    : '<p style="color:var(--ink-faint); margin:0;"><em>No package coverage gaps.</em></p>';
+
+  const div = document.createElement('div');
+  div.className = 'section section-A';
+  div.innerHTML = `
+    <div class="section-label"><span>Frame roles</span><span style="color:var(--ink-faint);">primary before auxiliary</span></div>
+    <div class="section-content">
+      <div class="trace-row"><div class="trace-row-label">Primary frame(s)</div><div class="trace-row-body"><code>${escapeHtml(summary.primary)}</code></div></div>
+      <div class="trace-row"><div class="trace-row-label">Auxiliary checker frame(s)</div><div class="trace-row-body"><code>${escapeHtml(summary.auxiliary)}</code></div></div>
+      <div class="trace-row"><div class="trace-row-label">Safety frame(s)</div><div class="trace-row-body"><code>${escapeHtml(summary.safety)}</code></div></div>
+      <div class="trace-row"><div class="trace-row-label">Package coverage gaps</div><div class="trace-row-body">${gapHtml}</div></div>
+    </div>
+  `;
+  return div;
 }
 
 function renderAnswerSummaryCard(query, trace, sections) {
@@ -2347,6 +2554,16 @@ function renderProtocolTraceDetails(sections) {
     : '<p style="color:var(--ink-faint); font-size:13px; margin:0;"><em>No package-bound citations.</em></p>';
 
   const synthesisHtml = sections.sectionD_note || '<em>No synthesis beyond packages is shown before the package-bound answer.</em>';
+  const roleSummary = t.frame_roles ? friendlyFrameRoleSummary({
+    frame_roles: t.frame_roles,
+    domain_coverage_gaps: t.domain_coverage_gaps || []
+  }) : null;
+  const roleHtml = roleSummary
+    ? `<p style="margin:0; font-size:13px;"><strong>Primary:</strong> ${escapeHtml(roleSummary.primary)}<br><strong>Auxiliary:</strong> ${escapeHtml(roleSummary.auxiliary)}<br><strong>Safety:</strong> ${escapeHtml(roleSummary.safety)}</p>`
+    : '<p style="color:var(--ink-faint); font-size:13px; margin:0;"><em>No frame roles assigned.</em></p>';
+  const gapHtml = t.domain_coverage_gaps && t.domain_coverage_gaps.length
+    ? '<ul class="trace-list">' + t.domain_coverage_gaps.map(g => `<li><code>${escapeHtml(g.package_id)}</code> ${escapeHtml(g.detail)}</li>`).join('') + '</ul>'
+    : '<p style="color:var(--ink-faint); font-size:13px; margin:0;"><em>No package coverage gaps.</em></p>';
 
   details.innerHTML = `
     <summary>Full protocol trace</summary>
@@ -2359,6 +2576,8 @@ function renderProtocolTraceDetails(sections) {
         <div class="trace-row"><div class="trace-row-label">Triggered constraints</div><div class="trace-row-body">${constraintsHtml}</div></div>
         <div class="trace-row"><div class="trace-row-label">Matched trajectory</div><div class="trace-row-body">${trajHtml}</div></div>
         <div class="trace-row"><div class="trace-row-label">Frame conflicts</div><div class="trace-row-body">${frameHtml}</div></div>
+        <div class="trace-row"><div class="trace-row-label">Frame roles</div><div class="trace-row-body">${roleHtml}</div></div>
+        <div class="trace-row"><div class="trace-row-label">Coverage gaps</div><div class="trace-row-body">${gapHtml}</div></div>
         <div class="trace-row"><div class="trace-row-label">Package-bound citations</div><div class="trace-row-body">${citationHtml}</div></div>
         <div class="trace-row"><div class="trace-row-label">Synthesis boundary</div><div class="trace-row-body">${synthesisHtml}</div></div>
       </div>
@@ -2372,6 +2591,7 @@ function renderRawResponse(trace, sections, query = '') {
   const out = document.getElementById('output');
   out.innerHTML = '';
   const summary = renderAnswerSummaryCard(query, trace, sections);
+  out.appendChild(renderFrameRolesCard(trace));
   out.appendChild(summary.div);
   out.appendChild(renderPackageBoundCard(sections));
   out.appendChild(renderConstraintsCard(sections));
@@ -2383,6 +2603,7 @@ function renderComposedResponse(trace, sections, composedText, query = '') {
   const out = document.getElementById('output');
   out.innerHTML = '';
   const summary = renderAnswerSummaryCard(query, trace, sections);
+  out.appendChild(renderFrameRolesCard(trace));
   out.appendChild(summary.div);
   out.appendChild(renderPackageBoundCard(sections, composedText));
   out.appendChild(renderConstraintsCard(sections));
@@ -2852,6 +3073,12 @@ const SCENARIOS = [
         query: 'What is the time complexity of quicksort? Is it related to Kolmogorov complexity?',
         requires: ['computer_science_systems_core'],
         watch: 'computer_science_systems_core handles Big-O / time complexity. kolmogorov_wiki (if loaded) only addresses the explicit Kolmogorov relation — it must not dominate the answer just because the word "complexity" appears.'
+      },
+      {
+        label: 'rock falling: physics primary',
+        query: 'Every rock must fall from above to below because of the gravity.',
+        requires: ['physics_dynamical_constraints_core', 'math_proof_core'],
+        watch: 'physics_dynamical_constraints_core should be primary or surface a domain_detected_no_cluster gap. math_proof_core may appear only as an auxiliary universal-claim checker; statistics_core should not dominate.'
       }
     ]
   },
@@ -3181,6 +3408,7 @@ function loadPackageFromText(text, sourceName) {
     return { ok: false, error: `${sourceName}: ${obj.manifest.package_id} is already loaded` };
   }
   applyPackagePatch(obj);
+  applyPackageIntegrationPatch(obj);
   LOADED_PACKAGES.push(obj);
   return { ok: true, pkg_id: obj.manifest.package_id };
 }
