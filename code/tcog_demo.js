@@ -132,6 +132,15 @@ const PHYSICS_GRAVITY_TOKENS = [
   'near earth', 'near-earth', 'unsupported', 'accelerates', 'motion', 'force', 'mass'
 ];
 
+const STATISTICS_CUE_TOKENS = [
+  'statistics', 'statistical', 't-test', 't test', 'ttest',
+  'hypothesis test', 'null hypothesis', 'alternative hypothesis',
+  'p-value', 'p value', 'pvalue', 'test statistic',
+  'degrees of freedom', 'confidence interval', 'statistical test',
+  'significance test', 'inferential statistics', 'sample',
+  'population', 'variance', 'standard error'
+];
+
 function ensureArrayUnique(arr, values) {
   for (const value of values) {
     if (!arr.some(existing => normalize(existing) === normalize(value))) arr.push(value);
@@ -141,6 +150,42 @@ function ensureArrayUnique(arr, values) {
 function applyPackageIntegrationPatch(pkg) {
   const id = pkg.manifest && pkg.manifest.package_id;
   if (!id) return;
+
+  if (id === 'statistics_core') {
+    const policy = pkg.manifest.activation_policy || (pkg.manifest.activation_policy = {});
+    policy.strict_domain_tokens = policy.strict_domain_tokens || pkg.manifest.strict_domain_tokens || [];
+    ensureArrayUnique(policy.strict_domain_tokens, STATISTICS_CUE_TOKENS);
+    policy.activate_when = policy.activate_when || [];
+    ensureArrayUnique(policy.activate_when, STATISTICS_CUE_TOKENS);
+
+    const unitId = `${id}:u_statistical_hypothesis_tests`;
+    if (!pkg.units.some(u => u.id === unitId)) {
+      pkg.units.push({
+        id: unitId,
+        label: 'Statistical hypothesis tests',
+        definition: 'T-tests, p-values, test statistics, confidence intervals, null hypotheses, and alternative hypotheses belong to inferential statistics and require explicit statistical framing.',
+        status: 'draft',
+        anchors: [{
+          source_id: `${id}:package_authored_axiom`,
+          location: 'package-authored draft unit',
+          excerpt: 'Statistical test claims require inferential-statistics framing.'
+        }]
+      });
+    }
+
+    const clusterId = `${id}:k_statistical_hypothesis_tests`;
+    if (!pkg.clusters.some(c => c.id === clusterId)) {
+      pkg.clusters.push({
+        id: clusterId,
+        label: 'statistical hypothesis tests',
+        description: 'Frames inferential-statistics claims about t-tests, p-values, null and alternative hypotheses, test statistics, confidence intervals, samples, and populations.',
+        cues: STATISTICS_CUE_TOKENS.slice(),
+        negative_cues: ['unit test', 'integration test', 'software test', 'regression test', 'test suite'],
+        members: [unitId]
+      });
+    }
+    return;
+  }
 
   if (id !== 'physics_dynamical_constraints_core') return;
   const policy = pkg.manifest.activation_policy || (pkg.manifest.activation_policy = {});
@@ -207,6 +252,11 @@ function queryIsNormativeOrEthical(query) {
   return query && /\b(should|ought|moral|morally|ethical|ethics|fair|fairness|justice|right|wrong|value|values|legitimate|good|bad)\b/i.test(query);
 }
 
+function hasStatisticsDomainCue(query) {
+  const queryNorm = normalize(query);
+  return STATISTICS_CUE_TOKENS.some(cue => phraseMatchInQuery(cue, queryNorm));
+}
+
 function getPackageRole(query, pkg) {
   const role = pkg.manifest && pkg.manifest.package_role;
   const allowed = new Set(['primary_domain', 'auxiliary_checker', 'safety_gate', 'method_frame', 'unknown']);
@@ -214,7 +264,7 @@ function getPackageRole(query, pkg) {
 
   const id = pkg.manifest?.package_id || '';
   if (id === 'math_proof_core') return 'auxiliary_checker';
-  if (id === 'statistics_core') return 'auxiliary_checker';
+  if (id === 'statistics_core') return hasStatisticsDomainCue(query) ? 'primary_domain' : 'auxiliary_checker';
   if (id === 'philosophy_ethics_core') return queryIsNormativeOrEthical(query) ? 'primary_domain' : 'auxiliary_checker';
   if (id === 'physics_dynamical_constraints_core') return 'primary_domain';
   if (id === 'chemistry_interactions_core') return 'primary_domain';
@@ -250,6 +300,12 @@ function applyPackagePatch(pkg) {
 // ---------------------------------------------------------------------------
 // Cue normalization — exactly per protocol §5.3
 // ---------------------------------------------------------------------------
+const CUE_STOPWORDS = new Set([
+  'is', 'am', 'are', 'was', 'were', 'be', 'been', 'being',
+  'a', 'an', 'the', 'of', 'to', 'in', 'on', 'for', 'by', 'with',
+  'and', 'or', 'but', 'as', 'at', 'from', 'this', 'that', 'it', 'its'
+]);
+
 function normalize(text) {
   return text
     .toLowerCase()
@@ -264,63 +320,145 @@ function tokenize(text) {
   return normalize(text).split(' ').filter(t => t.length > 0);
 }
 
-// Lemma match: "incentives" matches "incentive", "incentivizing" matches "incentive"
-function lemmaMatch(token, cue) {
-  const t = token.toLowerCase();
-  const c = cue.toLowerCase();
-  if (t === c) return true;
-  // crude lemma: token starts with cue and remainder is a common suffix
-  if (t.startsWith(c) && t.length > c.length) {
-    const suffix = t.slice(c.length);
-    if (['s','es','ed','ing','er','ly','ation','tion'].includes(suffix)) return true;
+function technicalTermVariants(term) {
+  const norm = normalize(term);
+  const variants = new Set(norm ? [norm] : []);
+  const compactable = new Set(['t test', 'p value', 'chi square', 'f test']);
+  if (compactable.has(norm)) variants.add(norm.replace(/\s+/g, ''));
+  if (['ttest', 'pvalue', 'chisquare', 'ftest'].includes(norm)) {
+    variants.add(norm);
+    const spaced = {
+      ttest: 't test',
+      pvalue: 'p value',
+      chisquare: 'chi square',
+      ftest: 'f test'
+    }[norm];
+    variants.add(spaced);
   }
-  if (c.startsWith(t) && c.length > t.length) {
-    const suffix = c.slice(t.length);
-    if (['s','es','ed','ing','er','ly'].includes(suffix)) return true;
+  return [...variants].filter(Boolean);
+}
+
+function isKnownTechnicalCompactCue(cueNorm) {
+  return ['ttest', 'pvalue', 'chisquare', 'ftest'].includes(cueNorm.replace(/\s+/g, ''));
+}
+
+function genericSingleCueAllowed(cueNorm, queryNorm) {
+  if (cueNorm !== 'test') return true;
+  const softwareTestNeighbors = [
+    'unit test', 'integration test', 'software test', 'regression test', 'test suite'
+  ];
+  return softwareTestNeighbors.some(term => phraseMatchInQuery(term, queryNorm));
+}
+
+function technicalCueMatches(cueNorm, queryNorm) {
+  const cueVariants = technicalTermVariants(cueNorm);
+  if (cueVariants.length <= 1 && !isKnownTechnicalCompactCue(cueNorm)) return false;
+  const queryTokens = tokenize(queryNorm);
+  const queryCompact = queryNorm.replace(/\s+/g, '');
+  for (const variant of cueVariants) {
+    if (variant.includes(' ')) {
+      if (` ${queryNorm} `.includes(` ${variant} `)) return true;
+    } else if (queryTokens.includes(variant) || queryCompact.includes(variant)) {
+      return true;
+    }
   }
   return false;
 }
 
-// Phrase match: cue can be multi-word phrase
-function phraseMatchInQuery(cue, queryNormalized) {
-  const cueNorm = normalize(cue);
-  if (cueNorm.length === 0) return false;
-  const cueTokens = cueNorm.split(' ');
-  // Substring containment is only safe for multi-word cues, where the spaces
-  // act as word boundaries. For single-token cues, raw substring containment
-  // produces false positives such as cue "ratio" matching query token "ration"
-  // — which caused chemistry_interactions_core to over-activate on healthcare
-  // rationing queries. Single-token cues must match a query token via lemma.
-  if (cueTokens.length > 1 && queryNormalized.includes(cueNorm)) return true;
-  if (cueTokens.length === 1) {
-    // single-token cue: lemma-match against query tokens
-    return tokenize(queryNormalized).some(t => lemmaMatch(t, cueNorm));
-  }
-  // multi-word: check sequential occurrence with at most 1 stop-word gap
-  const queryTokens = tokenize(queryNormalized);
-  const stopWords = new Set(['the','a','an','of','to','in','for','is','are','be','was','were']);
-  outer: for (let i = 0; i <= queryTokens.length - cueTokens.length; i++) {
-    let qi = i;
-    for (let ci = 0; ci < cueTokens.length; ci++) {
-      // skip stop words
-      while (qi < queryTokens.length && stopWords.has(queryTokens[qi]) && !lemmaMatch(queryTokens[qi], cueTokens[ci])) qi++;
-      if (qi >= queryTokens.length) continue outer;
-      if (!lemmaMatch(queryTokens[qi], cueTokens[ci])) continue outer;
-      qi++;
-    }
-    return true;
-  }
-  // Fallback for short multi-word cues (2 words): bag-of-tokens match.
-  // If both cue tokens appear anywhere in the query (lemma-tolerant), count as match.
-  // This handles word-order variations like "random string" vs "string to be random".
-  // Limited to 2-token cues to stay disciplined.
-  if (cueTokens.length === 2) {
-    const allMatch = cueTokens.every(ct =>
-      queryTokens.some(qt => lemmaMatch(qt, ct))
-    );
-    if (allMatch) return true;
+// Lemma match: "incentives" matches "incentive", "incentivizing" matches "incentive".
+// Matching is intentionally one-way: query token may carry a suffix, but a
+// short query token may not expand into a longer cue ("is" must not match "Iser").
+function lemmaMatch(token, cue) {
+  const t = normalize(token);
+  const c = normalize(cue);
+  if (!t || !c) return false;
+  if (t === c) return true;
+  if (CUE_STOPWORDS.has(t) || CUE_STOPWORDS.has(c)) return false;
+  if (t.length < 4 || c.length < 4) return false;
+  if (t.startsWith(c) && t.length > c.length) {
+    const suffix = t.slice(c.length);
+    if (['s','es','ed','ing','er','ly','ation','tion'].includes(suffix)) return true;
   }
   return false;
+}
+
+function phraseMatchDetails(cue, queryNormalized) {
+  const cueNorm = normalize(cue);
+  const queryNorm = normalize(queryNormalized);
+  const queryTokens = tokenize(queryNorm);
+  if (cueNorm.length === 0) {
+    return { matched: false, reason: 'empty cue' };
+  }
+  const cueTokens = cueNorm.split(' ');
+  const cueContentTokens = cueTokens.filter(t => !CUE_STOPWORDS.has(t));
+  if (cueContentTokens.length === 0) {
+    return { matched: false, reason: 'cue contains only stopwords' };
+  }
+  if (technicalCueMatches(cueNorm, queryNorm)) {
+    return { matched: true, reason: 'technical term variant match' };
+  }
+  if (cueTokens.length === 1) {
+    if (CUE_STOPWORDS.has(cueNorm)) {
+      return { matched: false, reason: 'single-token cue is a stopword' };
+    }
+    if (!genericSingleCueAllowed(cueNorm, queryNorm)) {
+      return { matched: false, reason: 'generic single-token cue lacks required domain neighbor' };
+    }
+    const matchedToken = queryTokens
+      .filter(t => !CUE_STOPWORDS.has(t))
+      .find(t => lemmaMatch(t, cueNorm));
+    return matchedToken
+      ? { matched: true, reason: `single-token lemma match: ${matchedToken}` }
+      : { matched: false, reason: 'no non-stopword token matched cue' };
+  }
+
+  if (queryNorm.includes(cueNorm) && cueContentTokens.some(ct => queryTokens.some(qt => lemmaMatch(qt, ct)))) {
+    return { matched: true, reason: 'multi-token phrase containment with content token match' };
+  }
+
+  // Multi-word cues are matched over their content words in order. Stopwords in
+  // the cue may help readability, but cannot be the only reason a package fires.
+  let qi = 0;
+  for (const cueToken of cueContentTokens) {
+    let found = false;
+    while (qi < queryTokens.length) {
+      const queryToken = queryTokens[qi++];
+      if (CUE_STOPWORDS.has(queryToken)) continue;
+      if (lemmaMatch(queryToken, cueToken)) {
+        found = true;
+        break;
+      }
+    }
+    if (!found) {
+      return { matched: false, reason: `missing cue content token: ${cueToken}` };
+    }
+  }
+
+  return { matched: true, reason: 'multi-token content words matched in order' };
+}
+
+// Phrase match: cue can be multi-word phrase
+function phraseMatchInQuery(cue, queryNormalized) {
+  return phraseMatchDetails(cue, queryNormalized).matched;
+}
+
+function debugCueMatch(cue, query) {
+  const normalizedCue = normalize(cue);
+  const normalizedQuery = normalize(query);
+  const details = phraseMatchDetails(cue, query);
+  return {
+    cue,
+    query,
+    normalizedCue,
+    normalizedQuery,
+    queryTokens: tokenize(query),
+    matched: details.matched,
+    reason: details.reason
+  };
+}
+
+if (typeof window !== 'undefined') {
+  window.debugCueMatch = debugCueMatch;
 }
 
 // ---------------------------------------------------------------------------
@@ -3325,6 +3463,12 @@ const SCENARIOS = [
         query: 'Under ordinary near-Earth conditions, an unsupported rock accelerates downward relative to the local gravitational field.',
         requires: ['physics_dynamical_constraints_core'],
         watch: 'Claim Solidity Appraisal regression: acceptable verdicts are Package-supported, Partial / needs caveat, or Coverage gap. Unacceptable: Frame-misaligned.'
+      },
+      {
+        label: 't-test cue routing (no Iser false match)',
+        query: 't-test is hypothesis test',
+        requires: ['statistics_core'],
+        watch: 'Lexical regression: art_form_affect_core must not activate from cue "Iser"; statistics_core should be primary when statistical-test cues are available; generic "test" alone should not let CS or proof frames dominate.'
       }
     ]
   },
