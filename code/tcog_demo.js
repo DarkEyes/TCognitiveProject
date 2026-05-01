@@ -2216,10 +2216,12 @@ function appraiseClaimSentence(sentence) {
   trace.frame_roles = frame_roles;
   const detailed = classifyClaimSentenceDetailed(sentence, trace);
   const verdict = detailed.verdict;
+  const display_status = claimDisplayStatus(verdict, trace, detailed.verdict_debug);
   return {
     sentence,
     trace,
     verdict,
+    display_status,
     verdict_debug: detailed.verdict_debug,
     frame_fit: detailed.verdict_debug.frame_fit,
     frame_roles,
@@ -2261,6 +2263,70 @@ function aggregateSolidityVerdict(claims) {
   return 'UNSUPPORTED';
 }
 
+function isSupportedWithCaveatDebug(debug) {
+  return !!debug &&
+    debug.final_rule_applied === 'support_with_constraints_or_multiframe' &&
+    debug.has_domain_support === true &&
+    debug.has_any_support === true &&
+    (debug.frame_misalignment_reasons || []).length === 0 &&
+    (debug.coverage_gap_reasons || []).length === 0;
+}
+
+function claimDisplayStatus(verdict, trace, debug) {
+  const frameStatus = debug?.frame_fit?.frame_fit_status || 'unknown';
+  const blocking = (trace.triggered_constraints || []).some(t => t.constraint.blocks_answer);
+  const triggered = (trace.triggered_constraints || []).length > 0;
+  const caveatNeeded = isSupportedWithCaveatDebug(debug) || frameStatus === 'valid_multi_frame' || triggered;
+
+  let support_verdict;
+  if (blocking || verdict === 'BLOCKED') {
+    support_verdict = 'Blocked';
+  } else if (verdict === 'COVERAGE_GAP' || frameStatus === 'coverage_gap') {
+    support_verdict = 'Coverage gap';
+  } else if (verdict === 'UNSUPPORTED' || verdict === 'MISFRAMED') {
+    support_verdict = 'Unsupported';
+  } else if (debug?.has_domain_support && debug?.has_any_support) {
+    support_verdict = 'Package-supported';
+  } else if (verdict === 'FRAGILE' || (trace.units || []).length > 0 || (trace.activated_clusters || []).length > 0) {
+    support_verdict = 'Weakly supported';
+  } else {
+    support_verdict = 'Unsupported';
+  }
+
+  const frame_fit = {
+    frame_aligned: 'Aligned',
+    valid_multi_frame: 'Valid multi-frame',
+    frame_misaligned: 'Frame-misaligned',
+    coverage_gap: 'Coverage gap'
+  }[frameStatus] || 'Aligned';
+
+  let caveat_status = 'No caveat triggered';
+  if (blocking) {
+    caveat_status = 'Blocking constraint triggered';
+  } else if (triggered && verdict !== 'SOLID') {
+    caveat_status = 'Constraint repair needed';
+  } else if (caveatNeeded) {
+    caveat_status = 'Caveat needed';
+  }
+
+  const main_label = support_verdict === 'Package-supported' && caveat_status !== 'No caveat triggered'
+    ? 'Package-supported, caveat needed'
+    : support_verdict;
+
+  const explanation = support_verdict === 'Package-supported' && caveat_status !== 'No caveat triggered'
+    ? 'This means TCog-R found package support and no frame mismatch, but at least one constraint/caveat was triggered. The claim is not rejected; it needs a more precise formulation.'
+    : '';
+
+  return {
+    support_verdict,
+    frame_fit,
+    frame_fit_status: frameStatus,
+    caveat_status,
+    main_label,
+    explanation
+  };
+}
+
 function appraiseClaimSolidity(text) {
   const claims = splitIntoClaimSentences(text)
     .filter(s => tokenize(s).length >= 5)
@@ -2270,6 +2336,20 @@ function appraiseClaimSolidity(text) {
 
   const supportedCount = claims.filter(c => c.verdict === 'SOLID' || c.verdict === 'PARTIAL').length;
   const constraintCount = claims.filter(c => c.triggered_constraints.length > 0).length;
+  const caveatCount = claims.filter(c => c.display_status?.caveat_status !== 'No caveat triggered').length;
+  const supportCounts = {
+    package_supported: claims.filter(c => c.display_status?.support_verdict === 'Package-supported').length,
+    weakly_supported: claims.filter(c => c.display_status?.support_verdict === 'Weakly supported').length,
+    unsupported: claims.filter(c => c.display_status?.support_verdict === 'Unsupported').length,
+    coverage_gap: claims.filter(c => c.display_status?.support_verdict === 'Coverage gap').length,
+    blocked: claims.filter(c => c.display_status?.support_verdict === 'Blocked').length
+  };
+  const caveatCounts = {
+    no_caveat: claims.filter(c => c.display_status?.caveat_status === 'No caveat triggered').length,
+    caveat_needed: claims.filter(c => c.display_status?.caveat_status === 'Caveat needed').length,
+    constraint_repair_needed: claims.filter(c => c.display_status?.caveat_status === 'Constraint repair needed').length,
+    blocking_constraint: claims.filter(c => c.display_status?.caveat_status === 'Blocking constraint triggered').length
+  };
   const frameCounts = {
     frame_aligned: claims.filter(c => c.frame_fit?.frame_fit_status === 'frame_aligned').length,
     valid_multi_frame: claims.filter(c => c.frame_fit?.frame_fit_status === 'valid_multi_frame').length,
@@ -2296,6 +2376,14 @@ function appraiseClaimSolidity(text) {
     constraint_summary: constraintCount
       ? `${constraintCount} claim${constraintCount !== 1 ? 's' : ''} constraint-triggered.`
       : 'No constraints triggered.',
+    support_counts: supportCounts,
+    caveat_counts: caveatCounts,
+    support_verdict_summary: claims.length
+      ? `${supportCounts.package_supported} package-supported.\n${supportCounts.weakly_supported} weakly supported.\n${supportCounts.unsupported} unsupported.\n${supportCounts.coverage_gap} coverage gap${supportCounts.coverage_gap !== 1 ? 's' : ''}.\n${supportCounts.blocked} blocked.`
+      : '0 package-supported.\n0 weakly supported.\n0 unsupported.\n0 coverage gaps.\n0 blocked.',
+    caveat_status_summary: claims.length
+      ? `${caveatCounts.no_caveat} no caveat triggered.\n${caveatCounts.caveat_needed} caveat needed.\n${caveatCounts.constraint_repair_needed} constraint repair needed.\n${caveatCounts.blocking_constraint} blocking constraint triggered.\n${caveatCount} claim${caveatCount !== 1 ? 's have' : ' has'} a caveat or triggered constraint.`
+      : '0 no caveat triggered.\n0 caveat needed.\n0 constraint repair needed.\n0 blocking constraint triggered.\n0 claims have a caveat or triggered constraint.',
     frame_fit_counts: frameCounts,
     frame_fit_summary: claims.length
       ? `${frameCounts.frame_aligned} claim${frameCounts.frame_aligned !== 1 ? 's' : ''} frame-aligned.\n${frameCounts.valid_multi_frame} valid multi-frame.\n${frameCounts.frame_misaligned} frame-misaligned.\n${frameCounts.coverage_gap} coverage gap${frameCounts.coverage_gap !== 1 ? 's' : ''}.`
@@ -2312,8 +2400,8 @@ window.debugSoliditySentence = debugSoliditySentence;
 function verdictClassLabel(verdict) {
   return {
     SOLID: 'Package-supported',
-    PARTIAL: 'Partial / needs caveat',
-    FRAGILE: 'Partial / needs caveat',
+    PARTIAL: 'Package-supported, caveat needed',
+    FRAGILE: 'Weakly supported',
     COVERAGE_GAP: 'Coverage gap',
     MISFRAMED: 'Frame-misaligned',
     UNSUPPORTED: 'Unsupported',
@@ -2342,11 +2430,24 @@ function verdictExplanation(verdict) {
 
 function frameFitStatusLabel(status) {
   return {
-    frame_aligned: 'frame_aligned',
-    valid_multi_frame: 'valid_multi_frame',
-    frame_misaligned: 'frame_misaligned',
-    coverage_gap: 'coverage_gap'
+    frame_aligned: 'Aligned',
+    valid_multi_frame: 'Valid multi-frame',
+    frame_misaligned: 'Frame-misaligned',
+    coverage_gap: 'Coverage gap'
   }[status] || status || 'unknown';
+}
+
+function appraisalOverallDisplayLabel(appraisal) {
+  const claims = appraisal.claims || [];
+  if (claims.length > 0 &&
+      claims.every(c => c.display_status?.support_verdict === 'Package-supported') &&
+      claims.some(c => c.display_status?.caveat_status !== 'No caveat triggered')) {
+    return 'Package-supported, caveat needed';
+  }
+  if (claims.length > 0 && claims.every(c => c.display_status?.support_verdict === 'Package-supported')) {
+    return 'Package-supported';
+  }
+  return verdictClassLabel(appraisal.overall);
 }
 
 function renderVerdictDebug(debug) {
@@ -2413,16 +2514,36 @@ function renderSolidityAppraisal(appraisal, repairedText = null) {
         <td>${escapeHtml(diagnosticValue(c.active_packages))}</td>
         <td>${escapeHtml(diagnosticValue(c.active_clusters.map(shortClusterId)))}</td>
         <td>${escapeHtml(diagnosticValue(c.triggered_constraints))}</td>
-        <td><span class="verdict-pill">${escapeHtml(verdictClassLabel(c.verdict))}</span>${verdictExplanation(c.verdict) ? `<div style="font-size:12px; color:var(--ink-soft); margin-top:4px;">${escapeHtml(verdictExplanation(c.verdict))}</div>` : ''}<div style="font-size:12px; color:var(--ink-soft); margin-top:4px;">Frame fit: <code>${escapeHtml(frameFitStatusLabel(c.frame_fit?.frame_fit_status))}</code>${c.frame_fit?.reason ? ` — ${escapeHtml(c.frame_fit.reason)}` : ''}</div>${renderVerdictDebug(c.verdict_debug)}</td>
+        <td>
+          <span class="verdict-pill">${escapeHtml(c.display_status?.main_label || verdictClassLabel(c.verdict))}</span>
+          ${c.display_status?.explanation ? `<div style="font-size:12px; color:var(--ink-soft); margin-top:4px;">${escapeHtml(c.display_status.explanation)}</div>` : ''}
+          ${verdictExplanation(c.verdict) ? `<div style="font-size:12px; color:var(--ink-soft); margin-top:4px;">${escapeHtml(verdictExplanation(c.verdict))}</div>` : ''}
+          <div style="font-size:12px; color:var(--ink-soft); margin-top:4px;">Support verdict: <code>${escapeHtml(c.display_status?.support_verdict || 'unknown')}</code></div>
+          <div style="font-size:12px; color:var(--ink-soft); margin-top:4px;">Frame fit: <code>${escapeHtml(c.display_status?.frame_fit || frameFitStatusLabel(c.frame_fit?.frame_fit_status))}</code>${c.frame_fit?.reason ? ` — ${escapeHtml(c.frame_fit.reason)}` : ''}</div>
+          <div style="font-size:12px; color:var(--ink-soft); margin-top:4px;">Caveat status: <code>${escapeHtml(c.display_status?.caveat_status || 'unknown')}</code></div>
+          ${renderVerdictDebug(c.verdict_debug)}
+        </td>
         <td>${escapeHtml(c.suggested_repair)}</td>
       </tr>
     `).join('')
     : `<tr><td colspan="7" style="color:var(--ink-faint);"><em>No claim-like sentences found.</em></td></tr>`;
 
   div.innerHTML = `
-    <div class="section-label"><span>Claim Solidity Appraisal</span><span class="verdict-pill">${escapeHtml(verdictClassLabel(appraisal.overall))}</span></div>
+    <div class="section-label"><span>Claim Solidity Appraisal</span><span class="verdict-pill">${escapeHtml(appraisalOverallDisplayLabel(appraisal))}</span></div>
     <div class="comparison-grid">
       ${renderFrameRoleSummary(appraisal)}
+      <div class="comparison-pane">
+        <h4>Support verdict</h4>
+        <p style="white-space:pre-line;">${escapeHtml(appraisal.support_verdict_summary)}</p>
+      </div>
+      <div class="comparison-pane">
+        <h4>Frame fit</h4>
+        <p style="white-space:pre-line;">${escapeHtml(appraisal.frame_fit_summary)}</p>
+      </div>
+      <div class="comparison-pane">
+        <h4>Caveat status</h4>
+        <p style="white-space:pre-line;">${escapeHtml(appraisal.caveat_status_summary)}</p>
+      </div>
       <div class="comparison-pane">
         <h4>Support summary</h4>
         <p>${escapeHtml(appraisal.support_summary)}</p>
@@ -2437,7 +2558,8 @@ function renderSolidityAppraisal(appraisal, repairedText = null) {
       </div>
       <div class="comparison-pane">
         <h4>Overall verdict</h4>
-        <p><span class="verdict-pill">${escapeHtml(verdictClassLabel(appraisal.overall))}</span></p>
+        <p><span class="verdict-pill">${escapeHtml(appraisalOverallDisplayLabel(appraisal))}</span></p>
+        ${appraisal.claims.some(c => c.display_status?.explanation) ? `<p style="font-size:12px; color:var(--ink-soft);">${escapeHtml('This means TCog-R found package support and no frame mismatch, but at least one constraint/caveat was triggered. The claim is not rejected; it needs a more precise formulation.')}</p>` : ''}
       </div>
     </div>
     <div style="overflow-x:auto; margin-top:14px;">
@@ -3577,7 +3699,7 @@ const SCENARIOS = [
         label: 'near-Earth rock: not frame-misaligned',
         query: 'Under ordinary near-Earth conditions, an unsupported rock accelerates downward relative to the local gravitational field.',
         requires: ['physics_dynamical_constraints_core'],
-        watch: 'Claim Solidity Appraisal regression: acceptable verdicts are Package-supported, Partial / needs caveat, or Coverage gap. Unacceptable: Frame-misaligned.'
+        watch: 'Claim Solidity Appraisal regression: acceptable verdicts are Package-supported, Package-supported with caveat, Weakly supported, or Coverage gap. Unacceptable: Frame-misaligned.'
       },
       {
         label: 't-test cue routing (no Iser false match)',
