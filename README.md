@@ -24,7 +24,4 @@ The demo runs in the browser. Package routing, cluster activation, constraint ch
 
 ## Architecture Overview
 
-
-[Open the live TCog-R demo](https://darkeyes.github.io/TCognitiveProject/code/tcog_demo.html)
-
 ![TCog Architecture](assets/TCogArch.png)
