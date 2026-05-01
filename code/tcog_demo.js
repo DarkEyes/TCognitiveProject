@@ -481,8 +481,8 @@ function routeOnePackage(query, pkg) {
   } else {
     const tags = pkg.manifest.tags || [];
     const domain = pkg.manifest.domain || '';
-    const tagMatch = tags.some(t => queryNorm.includes(normalize(t)));
-    const domainMatch = domain && queryNorm.includes(normalize(domain));
+    const tagMatch = tags.some(t => phraseMatchInQuery(t, queryNorm));
+    const domainMatch = domain && phraseMatchInQuery(domain, queryNorm);
     classification = (tagMatch || domainMatch) ? 'candidate' : 'check_clusters';
   }
 
@@ -492,6 +492,37 @@ function routeOnePackage(query, pkg) {
     activate_matches: activateMatches,
     avoid_matches: avoidMatches
   };
+}
+
+function debugPackageCueMatches(query, packageId = null) {
+  const queryNorm = normalize(query);
+  return LOADED_PACKAGES
+    .filter(pkg => !packageId || pkg.manifest.package_id === packageId)
+    .map(pkg => {
+      const routing = routeOnePackage(query, pkg);
+      const gate = checkDomainGate(query, pkg);
+      const clusters = activateClustersInPackage(query, pkg, routing).map(a => ({
+        id: a.cluster.id,
+        label: a.cluster.label,
+        score: a.score,
+        positive_matches: a.positive_matches,
+        negative_matches: a.negative_matches,
+        match_details: (a.positive_matches || []).map(cue => ({
+          cue,
+          ...phraseMatchDetails(cue, queryNorm)
+        }))
+      }));
+      return {
+        package_id: pkg.manifest.package_id,
+        routing,
+        strict_domain_gate: gate,
+        activated_clusters: clusters
+      };
+    });
+}
+
+if (typeof window !== 'undefined') {
+  window.debugPackageCueMatches = debugPackageCueMatches;
 }
 
 // ---------------------------------------------------------------------------
@@ -700,16 +731,14 @@ function retrieve(query) {
       });
       continue;
     }
-    // Domain-gate (overreach) check.
-    // For a package with strict domain tokens from metadata or deprecated JS
-    // fallback, always surface the gate result. If the gate fails, the package
-    // is marked `suppressed_due_to_overreach` and contributes no clusters.
-    // We tentatively activate first to expose any generic cue matches that
-    // *would* have activated under a less strict regime — that's the
-    // architectural point the demo is making visible.
+    // Domain-gate (overreach) check. Tentatively activate first to expose
+    // generic cue matches that would have activated without strict gating. If
+    // nothing in the package matched at all, keep it out of suppressed output;
+    // it did not participate in the retrieval decision.
     const gate = checkDomainGate(query, pkg);
     if (!gate.passes) {
       const tentative = activateClustersInPackage(query, pkg, routing);
+      if (tentative.length === 0) continue;
       const cuesUsed = [...new Set(tentative.flatMap(a => a.positive_matches))];
       const detail = tentative.length > 0
         ? `Generic cues matched (${cuesUsed.join(', ')}) but no strong-domain token from this package appears in the query. Clusters dropped to prevent overreach.`
@@ -2026,6 +2055,72 @@ function coverageGapReasons(sentence, trace, domainInfo) {
   );
 }
 
+function frameFitDetails(sentence, trace, domainInfo = buildDomainInfo(sentence, trace)) {
+  const roles = trace.frame_roles || assignFrameRoles(sentence, trace);
+  const primaryFrame = roles.primary_frame || detectPrimaryDomain(sentence, trace);
+  const primaryId = primaryFrame?.package_id || null;
+  const auxiliaryFrames = (roles.auxiliary_frames || []).concat(roles.safety_frames || []);
+  const activeUnrelatedFrames = (trace.active_packages || [])
+    .filter(pkg => {
+      const pkgId = pkg.manifest.package_id;
+      if (pkgId === primaryId) return false;
+      const role = getPackageRole(sentence, pkg);
+      if (role === 'auxiliary_checker' || role === 'method_frame' || role === 'safety_gate') return false;
+      return !domainInfo.detected_domain_packages.some(d => d.package_id === pkgId);
+    })
+    .map(pkg => pkg.manifest.package_id);
+
+  const coverageReasons = coverageGapReasons(sentence, trace, domainInfo);
+  if (coverageReasons.length > 0) {
+    return {
+      detected_domain: domainInfo.detected_domain_packages.map(d => d.package_id),
+      primary_frame: primaryId || 'none',
+      auxiliary_frames: auxiliaryFrames.map(f => f.package_id),
+      active_unrelated_frames: activeUnrelatedFrames,
+      frame_fit_status: 'coverage_gap',
+      reason: coverageReasons.join(' ')
+    };
+  }
+
+  const misalignmentReasons = frameMisalignmentReasons(sentence, trace, domainInfo);
+  if (isTrueFrameMisalignment(sentence, trace, domainInfo)) {
+    return {
+      detected_domain: domainInfo.detected_domain_packages.map(d => d.package_id),
+      primary_frame: primaryId || 'none',
+      auxiliary_frames: auxiliaryFrames.map(f => f.package_id),
+      active_unrelated_frames: activeUnrelatedFrames,
+      frame_fit_status: 'frame_misaligned',
+      reason: misalignmentReasons.join(' ') || 'Wrong or incompatible frame dominates the claim.'
+    };
+  }
+
+  const relevantFrameCount = (trace.active_packages || []).filter(pkg => {
+    const role = getPackageRole(sentence, pkg);
+    return role === 'primary_domain' || role === 'auxiliary_checker' || role === 'method_frame' || role === 'safety_gate';
+  }).length;
+  if (relevantFrameCount > 1 || auxiliaryFrames.length > 0) {
+    return {
+      detected_domain: domainInfo.detected_domain_packages.map(d => d.package_id),
+      primary_frame: primaryId || 'none',
+      auxiliary_frames: auxiliaryFrames.map(f => f.package_id),
+      active_unrelated_frames: activeUnrelatedFrames,
+      frame_fit_status: 'valid_multi_frame',
+      reason: 'Multiple packages activated, but non-primary frames are compatible, auxiliary, or constraint-checking rather than dominant wrong frames.'
+    };
+  }
+
+  return {
+    detected_domain: domainInfo.detected_domain_packages.map(d => d.package_id),
+    primary_frame: primaryId || 'none',
+    auxiliary_frames: auxiliaryFrames.map(f => f.package_id),
+    active_unrelated_frames: activeUnrelatedFrames,
+    frame_fit_status: 'frame_aligned',
+    reason: domainInfo.has_domain_support
+      ? 'Primary domain package matches the claim and provides cluster or unit support.'
+      : 'No wrong-frame condition was detected.'
+  };
+}
+
 function domainGuardCorrectVerdict(sentence, trace, verdict, domainInfo) {
   if (verdict !== 'MISFRAMED') return { verdict, rule: 'no_guard_needed' };
   if (!domainInfo.has_detected_primary_domain || !domainInfo.uses_detected_domain_vocabulary) {
@@ -2044,6 +2139,7 @@ function domainGuardCorrectVerdict(sentence, trace, verdict, domainInfo) {
 }
 
 function verdictDebugBase(sentence, trace, domainInfo) {
+  const frameFit = frameFitDetails(sentence, trace, domainInfo);
   return {
     detected_domain_packages: domainInfo.detected_domain_packages.map(d => ({
       package_id: d.package_id,
@@ -2059,6 +2155,7 @@ function verdictDebugBase(sentence, trace, domainInfo) {
     has_any_support: (trace.units || []).length > 0 || (trace.activated_clusters || []).length > 0,
     frame_misalignment_reasons: frameMisalignmentReasons(sentence, trace, domainInfo),
     coverage_gap_reasons: coverageGapReasons(sentence, trace, domainInfo),
+    frame_fit: frameFit,
     final_rule_applied: ''
   };
 }
@@ -2124,6 +2221,7 @@ function appraiseClaimSentence(sentence) {
     trace,
     verdict,
     verdict_debug: detailed.verdict_debug,
+    frame_fit: detailed.verdict_debug.frame_fit,
     frame_roles,
     primary_frame: frame_roles.primary_frame,
     auxiliary_frames: frame_roles.auxiliary_frames,
@@ -2172,7 +2270,12 @@ function appraiseClaimSolidity(text) {
 
   const supportedCount = claims.filter(c => c.verdict === 'SOLID' || c.verdict === 'PARTIAL').length;
   const constraintCount = claims.filter(c => c.triggered_constraints.length > 0).length;
-  const frameCount = claims.filter(c => c.verdict === 'MISFRAMED' || c.verdict === 'COVERAGE_GAP' || (c.trace.active_packages || []).length > 1).length;
+  const frameCounts = {
+    frame_aligned: claims.filter(c => c.frame_fit?.frame_fit_status === 'frame_aligned').length,
+    valid_multi_frame: claims.filter(c => c.frame_fit?.frame_fit_status === 'valid_multi_frame').length,
+    frame_misaligned: claims.filter(c => c.frame_fit?.frame_fit_status === 'frame_misaligned').length,
+    coverage_gap: claims.filter(c => c.frame_fit?.frame_fit_status === 'coverage_gap').length
+  };
   const primaryFrames = [...new Set(claims.map(c => c.primary_frame?.package_id).filter(Boolean))];
   const constraintFrames = [...new Set(claims.flatMap(c => c.constraint_frames || []).map(f => f.package_id))];
   const suppressedFrames = [...new Set(claims.flatMap(c => c.suppressed_frames || []).map(f => f.package_id))];
@@ -2193,9 +2296,10 @@ function appraiseClaimSolidity(text) {
     constraint_summary: constraintCount
       ? `${constraintCount} claim${constraintCount !== 1 ? 's' : ''} constraint-triggered.`
       : 'No constraints triggered.',
-    frame_fit_summary: frameCount
-      ? `${frameCount} claim${frameCount !== 1 ? 's' : ''} frame-misaligned or multi-frame.`
-      : 'No major frame misalignment detected.'
+    frame_fit_counts: frameCounts,
+    frame_fit_summary: claims.length
+      ? `${frameCounts.frame_aligned} claim${frameCounts.frame_aligned !== 1 ? 's' : ''} frame-aligned.\n${frameCounts.valid_multi_frame} valid multi-frame.\n${frameCounts.frame_misaligned} frame-misaligned.\n${frameCounts.coverage_gap} coverage gap${frameCounts.coverage_gap !== 1 ? 's' : ''}.`
+      : '0 claims frame-aligned.\n0 valid multi-frame.\n0 frame-misaligned.\n0 coverage gaps.'
   };
 }
 
@@ -2236,6 +2340,15 @@ function verdictExplanation(verdict) {
   return '';
 }
 
+function frameFitStatusLabel(status) {
+  return {
+    frame_aligned: 'frame_aligned',
+    valid_multi_frame: 'valid_multi_frame',
+    frame_misaligned: 'frame_misaligned',
+    coverage_gap: 'coverage_gap'
+  }[status] || status || 'unknown';
+}
+
 function renderVerdictDebug(debug) {
   if (!debug) return '';
   const fmt = (value) => Array.isArray(value)
@@ -2253,6 +2366,8 @@ function renderVerdictDebug(debug) {
         <p><strong>Has domain support:</strong> ${debug.has_domain_support ? 'true' : 'false'} · <strong>Has any support:</strong> ${debug.has_any_support ? 'true' : 'false'}</p>
         <p><strong>Frame-misalignment reasons:</strong> ${escapeHtml(fmt(debug.frame_misalignment_reasons))}</p>
         <p><strong>Coverage-gap reasons:</strong> ${escapeHtml(fmt(debug.coverage_gap_reasons))}</p>
+        <p><strong>frame_fit:</strong></p>
+        <pre style="white-space:pre-wrap; margin:4px 0 8px; color:var(--ink-soft);">${escapeHtml(JSON.stringify(debug.frame_fit || {}, null, 2))}</pre>
         <p><strong>Final rule applied:</strong> <code>${escapeHtml(debug.final_rule_applied || '—')}</code></p>
         ${debug.original_verdict ? `<p><strong>Corrected from:</strong> ${escapeHtml(debug.original_verdict)} via ${escapeHtml(debug.original_rule || '')}</p>` : ''}
       </div>
@@ -2298,7 +2413,7 @@ function renderSolidityAppraisal(appraisal, repairedText = null) {
         <td>${escapeHtml(diagnosticValue(c.active_packages))}</td>
         <td>${escapeHtml(diagnosticValue(c.active_clusters.map(shortClusterId)))}</td>
         <td>${escapeHtml(diagnosticValue(c.triggered_constraints))}</td>
-        <td><span class="verdict-pill">${escapeHtml(verdictClassLabel(c.verdict))}</span>${verdictExplanation(c.verdict) ? `<div style="font-size:12px; color:var(--ink-soft); margin-top:4px;">${escapeHtml(verdictExplanation(c.verdict))}</div>` : ''}${renderVerdictDebug(c.verdict_debug)}</td>
+        <td><span class="verdict-pill">${escapeHtml(verdictClassLabel(c.verdict))}</span>${verdictExplanation(c.verdict) ? `<div style="font-size:12px; color:var(--ink-soft); margin-top:4px;">${escapeHtml(verdictExplanation(c.verdict))}</div>` : ''}<div style="font-size:12px; color:var(--ink-soft); margin-top:4px;">Frame fit: <code>${escapeHtml(frameFitStatusLabel(c.frame_fit?.frame_fit_status))}</code>${c.frame_fit?.reason ? ` — ${escapeHtml(c.frame_fit.reason)}` : ''}</div>${renderVerdictDebug(c.verdict_debug)}</td>
         <td>${escapeHtml(c.suggested_repair)}</td>
       </tr>
     `).join('')
@@ -2318,7 +2433,7 @@ function renderSolidityAppraisal(appraisal, repairedText = null) {
       </div>
       <div class="comparison-pane">
         <h4>Frame-fit summary</h4>
-        <p>${escapeHtml(appraisal.frame_fit_summary)}</p>
+        <p style="white-space:pre-line;">${escapeHtml(appraisal.frame_fit_summary)}</p>
       </div>
       <div class="comparison-pane">
         <h4>Overall verdict</h4>
