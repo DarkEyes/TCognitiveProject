@@ -3882,17 +3882,18 @@ function showMissingPackagesBanner(scenario, missing) {
 // Packages folder fetch
 // ============================================================================
 // Browsers cannot enumerate local folders by themselves. This loader supports:
-// 1. packages/index.json containing ["file.zip", "package.combined.json"] or
-//    { "files": [...] }
-// 2. an HTTP directory listing, such as Python's `python3 -m http.server`
-// 3. a known fallback bundle name for this demo.
+// 1. an HTTP directory listing, such as Python's `python3 -m http.server`
+// 2. optional packages/index.json containing ["file.zip", "package.combined.json"]
+//    or { "files": [...] } for servers that disable directory listings.
 const PACKAGES_DIR_URL = './packages/';
-const FALLBACK_PACKAGE_FILES = [
-  'tcog_field_basis_packages_v0_3_7.zip'
-];
 
 async function discoverPackageFiles() {
   const files = new Set();
+  const addPackageFile = (name) => {
+    const cleanName = name.replace(/^\.?\/*/, '').replace(/[?#].*$/, '');
+    if (/^(?:packages\/)?index\.json$/i.test(cleanName)) return;
+    if (/\.(zip|json)$/i.test(cleanName)) files.add(cleanName);
+  };
 
   try {
     const resp = await fetch(PACKAGES_DIR_URL + 'index.json');
@@ -3901,7 +3902,7 @@ async function discoverPackageFiles() {
       const listed = Array.isArray(manifest) ? manifest : (manifest.files || []);
       for (const item of listed) {
         const name = typeof item === 'string' ? item : item?.path || item?.name;
-        if (name && /\.(zip|json)$/i.test(name)) files.add(name.replace(/^\.?\/*/, ''));
+        if (name) addPackageFile(name);
       }
     }
   } catch (e) {
@@ -3916,15 +3917,14 @@ async function discoverPackageFiles() {
       for (const a of doc.querySelectorAll('a[href]')) {
         const href = decodeURIComponent(a.getAttribute('href') || '');
         if (/^(?:\.\/)?[^?#]+\.(zip|json)(?:[?#].*)?$/i.test(href)) {
-          files.add(href.replace(/^\.?\/*/, '').replace(/[?#].*$/, ''));
+          addPackageFile(href);
         }
       }
     }
   } catch (e) {
-    // Directory listings may be disabled; fallback below covers the bundled demo.
+    // Directory listings may be disabled; packages/index.json is the portable path.
   }
 
-  for (const name of FALLBACK_PACKAGE_FILES) files.add(name);
   return [...files];
 }
 
@@ -3964,7 +3964,7 @@ async function loadPackagesFolder() {
   }
 
   if (files.length === 0) {
-    return { ok: false, error: 'no .zip or .json package files found in packages/' };
+    return { ok: false, error: 'no .zip or .json package files found in packages/. Serve with an HTTP server that exposes directory listings, or add an optional packages/index.json manifest.' };
   }
 
   const errors = [];
