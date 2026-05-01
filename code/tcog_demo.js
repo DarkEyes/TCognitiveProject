@@ -2333,6 +2333,7 @@ function appraiseClaimSolidity(text) {
     .map(appraiseClaimSentence);
 
   const overall = aggregateSolidityVerdict(claims);
+  const overallDisplayLabel = overallDisplayLabelForClaims(overall, claims);
 
   const supportedCount = claims.filter(c => c.verdict === 'SOLID' || c.verdict === 'PARTIAL').length;
   const constraintCount = claims.filter(c => c.triggered_constraints.length > 0).length;
@@ -2363,6 +2364,7 @@ function appraiseClaimSolidity(text) {
   return {
     input: text,
     overall,
+    overall_display_label: overallDisplayLabel,
     claims,
     frame_roles: {
       primary_frame: primaryFrames[0] || null,
@@ -2438,7 +2440,10 @@ function frameFitStatusLabel(status) {
 }
 
 function appraisalOverallDisplayLabel(appraisal) {
-  const claims = appraisal.claims || [];
+  return appraisal.overall_display_label || overallDisplayLabelForClaims(appraisal.overall, appraisal.claims || []);
+}
+
+function overallDisplayLabelForClaims(overall, claims) {
   if (claims.length > 0 &&
       claims.every(c => c.display_status?.support_verdict === 'Package-supported') &&
       claims.some(c => c.display_status?.caveat_status !== 'No caveat triggered')) {
@@ -2447,7 +2452,7 @@ function appraisalOverallDisplayLabel(appraisal) {
   if (claims.length > 0 && claims.every(c => c.display_status?.support_verdict === 'Package-supported')) {
     return 'Package-supported';
   }
-  return verdictClassLabel(appraisal.overall);
+  return verdictClassLabel(overall);
 }
 
 function renderVerdictDebug(debug) {
