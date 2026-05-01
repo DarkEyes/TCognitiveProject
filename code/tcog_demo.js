@@ -1533,6 +1533,73 @@ function traceHasSuppressedVocabulary(sentence, trace) {
     });
 }
 
+function isGenericFramePackage(pkg) {
+  const m = pkg.manifest || {};
+  const haystack = [
+    m.package_id || '',
+    m.domain || '',
+    (m.tags || []).join(' ')
+  ].join(' ');
+  return /\b(universal|proof|logic|statistics|statistical|probability|math|mathematics|epistemic|reasoning|method)\b/i.test(haystack);
+}
+
+function packageSpecificCueMatches(sentence, pkg) {
+  const sentenceNorm = normalize(sentence);
+  const manifest = pkg.manifest || {};
+  const policy = manifest.activation_policy || {};
+  const tokens = []
+    .concat(getStrictDomainTokens(pkg) || [])
+    .concat(policy.activate_when || [])
+    .concat(manifest.tags || [])
+    .concat(manifest.domain || []);
+  return [...new Set(tokens.filter(t => t && phraseMatchInQuery(t, sentenceNorm)))];
+}
+
+function frameCandidateScore(sentence, trace, pkg) {
+  const pkgId = pkg.manifest.package_id;
+  const cueMatches = packageSpecificCueMatches(sentence, pkg);
+  const clusterScore = (trace.activated_clusters || [])
+    .filter(a => a.package_id === pkgId)
+    .reduce((sum, a) => sum + (a.score || 0), 0);
+  const unitCount = (trace.units || []).filter(u => String(u.id || '').startsWith(`${pkgId}:`)).length;
+  const genericPenalty = isGenericFramePackage(pkg) ? 3 : 0;
+  return {
+    package_id: pkgId,
+    domain: pkg.manifest.domain || '',
+    cue_matches: cueMatches,
+    score: cueMatches.length * 4 + clusterScore + unitCount - genericPenalty,
+    is_generic: isGenericFramePackage(pkg)
+  };
+}
+
+function assignFrameRoles(sentence, trace) {
+  const active = (trace.active_packages || []).map(pkg => frameCandidateScore(sentence, trace, pkg));
+  const domainSpecific = active
+    .filter(f => !f.is_generic && f.cue_matches.length > 0)
+    .sort((a, b) => b.score - a.score);
+  const ranked = active.slice().sort((a, b) => b.score - a.score);
+  const primary = domainSpecific[0] || ranked[0] || null;
+  const primaryId = primary ? primary.package_id : null;
+  const constraintIds = new Set((trace.triggered_constraints || []).map(t => t.package_id));
+  const suppressedIds = new Set((trace.suppressed_packages || []).map(s => s.package_id));
+
+  return {
+    primary_frame: primary,
+    auxiliary_frames: ranked.filter(f => f.package_id !== primaryId && !constraintIds.has(f.package_id)),
+    constraint_frames: ranked.filter(f => constraintIds.has(f.package_id)),
+    suppressed_frames: (trace.suppressed_packages || []).map(s => ({
+      package_id: s.package_id,
+      domain: s.domain || '',
+      reason: s.reason,
+      detail: s.detail
+    })),
+    considered_frames: ranked,
+    note: domainSpecific.length > 0
+      ? 'Primary frame chosen by strongest domain-specific cue match.'
+      : 'Primary frame chosen from active packages; no domain-specific cue dominated.'
+  };
+}
+
 function classifyClaimSentence(sentence, trace) {
   const blocking = (trace.triggered_constraints || []).filter(t => t.constraint.blocks_answer);
   const units = trace.units || [];
@@ -1553,10 +1620,16 @@ function classifyClaimSentence(sentence, trace) {
 function appraiseClaimSentence(sentence) {
   const trace = retrieve(sentence);
   const verdict = classifyClaimSentence(sentence, trace);
+  const frame_roles = assignFrameRoles(sentence, trace);
   return {
     sentence,
     trace,
     verdict,
+    frame_roles,
+    primary_frame: frame_roles.primary_frame,
+    auxiliary_frames: frame_roles.auxiliary_frames,
+    constraint_frames: frame_roles.constraint_frames,
+    suppressed_frames: frame_roles.suppressed_frames,
     active_packages: (trace.active_packages || []).map(p => p.manifest.package_id),
     active_clusters: (trace.activated_clusters || []).map(a => a.cluster.id),
     triggered_constraints: (trace.triggered_constraints || []).map(t => t.constraint.id),
@@ -1599,11 +1672,20 @@ function appraiseClaimSolidity(text) {
   const supportedCount = claims.filter(c => c.verdict === 'SOLID' || c.verdict === 'PARTIAL').length;
   const constraintCount = claims.filter(c => c.triggered_constraints.length > 0).length;
   const frameCount = claims.filter(c => c.verdict === 'MISFRAMED' || (c.trace.active_packages || []).length > 1).length;
+  const primaryFrames = [...new Set(claims.map(c => c.primary_frame?.package_id).filter(Boolean))];
+  const constraintFrames = [...new Set(claims.flatMap(c => c.constraint_frames || []).map(f => f.package_id))];
+  const suppressedFrames = [...new Set(claims.flatMap(c => c.suppressed_frames || []).map(f => f.package_id))];
 
   return {
     input: text,
     overall,
     claims,
+    frame_roles: {
+      primary_frame: primaryFrames[0] || null,
+      auxiliary_frames: primaryFrames.slice(1),
+      constraint_frames: constraintFrames,
+      suppressed_frames: suppressedFrames
+    },
     support_summary: claims.length
       ? `${supportedCount} of ${claims.length} claims package-supported or partially package-supported.`
       : 'No claim-like sentences were found.',
@@ -1627,6 +1709,42 @@ function verdictClassLabel(verdict) {
   }[verdict] || verdict;
 }
 
+function frameLabel(frame) {
+  if (!frame) return 'none';
+  return typeof frame === 'string' ? frame : frame.package_id;
+}
+
+function frameListLabel(frames) {
+  return frames && frames.length ? frames.map(frameLabel).join(', ') : 'none';
+}
+
+function renderFrameRoleSummary(appraisal) {
+  const primaryClaims = appraisal.claims.filter(c => c.primary_frame);
+  const primaryFrame = appraisal.frame_roles.primary_frame || 'none';
+  const auxiliary = appraisal.frame_roles.auxiliary_frames || [];
+  const constraints = appraisal.frame_roles.constraint_frames || [];
+  const suppressed = appraisal.frame_roles.suppressed_frames || [];
+  const claimLines = primaryClaims.length
+    ? '<ul class="trace-list">' + primaryClaims.map(c =>
+        `<li><code>${escapeHtml(c.primary_frame.package_id)}</code> <span style="color:var(--ink-faint);">for</span> ${escapeHtml(c.sentence)}<div style="font-size:12px; color:var(--ink-soft);">domain cues: ${escapeHtml(diagnosticValue(c.primary_frame.cue_matches || []))}</div></li>`
+      ).join('') + '</ul>'
+    : '<p style="color:var(--ink-faint); margin:0;"><em>No primary frame assigned.</em></p>';
+
+  return `
+    <div class="comparison-pane">
+      <h4>Primary frame</h4>
+      <p><code>${escapeHtml(primaryFrame)}</code></p>
+      ${claimLines}
+    </div>
+    <div class="comparison-pane">
+      <h4>Auxiliary constraints</h4>
+      <p><strong>Auxiliary frames:</strong> ${escapeHtml(frameListLabel(auxiliary))}</p>
+      <p><strong>Constraint frames:</strong> ${escapeHtml(frameListLabel(constraints))}</p>
+      <p><strong>Suppressed frames:</strong> ${escapeHtml(frameListLabel(suppressed))}</p>
+    </div>
+  `;
+}
+
 function renderSolidityAppraisal(appraisal, repairedText = null) {
   const div = document.createElement('div');
   div.className = 'section section-compare';
@@ -1634,6 +1752,7 @@ function renderSolidityAppraisal(appraisal, repairedText = null) {
     ? appraisal.claims.map(c => `
       <tr>
         <td>${escapeHtml(c.sentence)}</td>
+        <td>${escapeHtml(frameLabel(c.primary_frame))}</td>
         <td>${escapeHtml(diagnosticValue(c.active_packages))}</td>
         <td>${escapeHtml(diagnosticValue(c.active_clusters.map(shortClusterId)))}</td>
         <td>${escapeHtml(diagnosticValue(c.triggered_constraints))}</td>
@@ -1641,11 +1760,12 @@ function renderSolidityAppraisal(appraisal, repairedText = null) {
         <td>${escapeHtml(c.suggested_repair)}</td>
       </tr>
     `).join('')
-    : `<tr><td colspan="6" style="color:var(--ink-faint);"><em>No claim-like sentences found.</em></td></tr>`;
+    : `<tr><td colspan="7" style="color:var(--ink-faint);"><em>No claim-like sentences found.</em></td></tr>`;
 
   div.innerHTML = `
     <div class="section-label"><span>Claim Solidity Appraisal</span><span class="verdict-pill">${escapeHtml(verdictClassLabel(appraisal.overall))}</span></div>
     <div class="comparison-grid">
+      ${renderFrameRoleSummary(appraisal)}
       <div class="comparison-pane">
         <h4>Support summary</h4>
         <p>${escapeHtml(appraisal.support_summary)}</p>
@@ -1668,6 +1788,7 @@ function renderSolidityAppraisal(appraisal, repairedText = null) {
         <thead>
           <tr>
             <th>Claim sentence</th>
+            <th>Primary frame</th>
             <th>Active packages</th>
             <th>Active clusters</th>
             <th>Triggered constraints</th>
@@ -1694,6 +1815,10 @@ function buildClaimRepairPrompt(appraisal) {
     const unitDetails = c.units.map(u => `[${u.id}] ${u.label || ''}: ${u.definition || ''}`).join('\n') || 'none';
     return `${idx + 1}. ${c.sentence}
 Verdict: ${c.verdict}
+Primary frame: ${frameLabel(c.primary_frame)}
+Auxiliary frames: ${frameListLabel(c.auxiliary_frames)}
+Constraint frames: ${frameListLabel(c.constraint_frames)}
+Suppressed frames: ${frameListLabel(c.suppressed_frames)}
 Active packages: ${diagnosticValue(c.active_packages)}
 Triggered constraints: ${diagnosticValue(c.triggered_constraints)}
 Retrieved unit ids: ${unitIds}
@@ -1724,6 +1849,10 @@ function buildSoliditySummaryPrompt(text, appraisalResult) {
     const unitIds = c.units.map(u => u.id).join(', ') || 'none';
     return `${idx + 1}. Claim: ${c.sentence}
 Verdict: ${c.verdict}
+Primary frame: ${frameLabel(c.primary_frame)}
+Auxiliary frames: ${frameListLabel(c.auxiliary_frames)}
+Constraint frames: ${frameListLabel(c.constraint_frames)}
+Suppressed frames: ${frameListLabel(c.suppressed_frames)}
 Active packages: ${diagnosticValue(c.active_packages)}
 Active clusters: ${diagnosticValue(c.active_clusters)}
 Triggered constraints: ${diagnosticValue(c.triggered_constraints)}
