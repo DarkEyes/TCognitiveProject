@@ -3318,12 +3318,160 @@ function renderLLMGuidedResult(result) {
 // ============================================================================
 // Appraisal maps each sentence to the existing TCog retrieval concepts:
 // package support, constraint triggers, frame fit, and overreach suppression.
+const PASSAGE_INHERITANCE_CONFIG = {
+  MIN_PASSAGE_AGGREGATE_SCORE: 4,
+  MIN_PASSAGE_FRAME_STRENGTH: 0.4,
+  MIN_PASSAGE_FRAME_SENTENCES: 2,
+  FLIP_MARGIN: 2,
+  MIN_FLIP_ABSOLUTE_SCORE: 3,
+  MECHANICAL_AUX_CONSTRAINT_REQUIRES_CLUSTER: true
+};
+
 function splitIntoClaimSentences(text) {
   return (text || '')
     .replace(/\s+/g, ' ')
     .split(/(?<=[.!?])\s+/)
     .map(s => s.trim())
     .filter(Boolean);
+}
+
+function splitIntoPassagesWithSentences(text) {
+  const rawPassages = String(text || '')
+    .split(/\n\s*\n+/)
+    .map(p => p.trim())
+    .filter(Boolean);
+  const passages = rawPassages.length ? rawPassages : [String(text || '').trim()].filter(Boolean);
+  return passages.map((passageText, passageIndex) => {
+    const normalized = passageText
+      .replace(/^\s*(?:[-*+]\s+|\d+[\.)]\s+)/gm, '')
+      .replace(/\n+/g, ' ');
+    return {
+      passage_index: passageIndex,
+      text: passageText,
+      sentences: splitIntoClaimSentences(normalized)
+    };
+  }).filter(p => p.sentences.length > 0);
+}
+
+function packageScoresForSentence(sentence) {
+  const scores = new Map();
+  const sentenceNorm = normalize(sentence || '');
+  const sentenceTokens = new Set(tokenize(sentence || ''));
+  const partialCueContinuationScore = (pkg) => {
+    let hits = 0;
+    for (const cluster of pkg.clusters || []) {
+      for (const cue of cluster.cues || []) {
+        const cueTokens = tokenize(cue).filter(t => !CUE_STOPWORDS.has(t) && t.length >= 5);
+        if (cueTokens.length >= 2 && cueTokens.some(t => sentenceTokens.has(t))) hits++;
+      }
+    }
+    return Math.min(2, hits);
+  };
+  for (const pkg of LOADED_PACKAGES) {
+    const routing = routeOnePackage(sentence, pkg);
+    if (routing.classification === 'avoid') continue;
+    const gate = checkDomainGate(sentence, pkg);
+    if (!gate.passes) continue;
+    const activated = activateClustersInPackage(sentence, pkg, routing);
+    const score = activated.reduce((sum, a) => sum + Math.max(0, a.score || 0), 0);
+    const domainHits = []
+      .concat(getStrictDomainTokens(pkg) || [])
+      .concat((pkg.manifest && pkg.manifest.tags) || [])
+      .concat((pkg.manifest && pkg.manifest.domain) || [])
+      .filter(t => t && phraseMatchInQuery(t, sentenceNorm));
+    const safetyLike = isPackageSafetyCritical(pkg) ||
+      SAFETY_PACKAGE_HINTS.some(h => String(pkg.manifest.package_id || '').toLowerCase().includes(h));
+    const partialContinuationScore = score > 0 || !safetyLike ? 0 : partialCueContinuationScore(pkg);
+    if (score > 0 || domainHits.length > 0 || partialContinuationScore > 0) {
+      const domainBonus = domainHits.length > 0 && getPackageRole(sentence, pkg) === 'primary_domain' ? 1 : 0;
+      scores.set(pkg.manifest.package_id, {
+        package_id: pkg.manifest.package_id,
+        score: score + domainBonus + partialContinuationScore,
+        cluster_score: score,
+        activated_clusters: activated.map(a => ({
+          id: a.cluster.id,
+          label: a.cluster.label || '',
+          score: a.score || 0,
+          cues: a.positive_matches || []
+        })),
+        domain_hits: [...new Set(domainHits)],
+        partial_continuation_score: partialContinuationScore
+      });
+    }
+  }
+  return scores;
+}
+
+function establishPassageFrame(passage) {
+  const aggregate = new Map();
+  const sentenceScoreMaps = [];
+  const sentenceHitsByPackage = new Map();
+  for (const sentence of passage.sentences) {
+    const scores = packageScoresForSentence(sentence);
+    sentenceScoreMaps.push(scores);
+    for (const entry of scores.values()) {
+      aggregate.set(entry.package_id, (aggregate.get(entry.package_id) || 0) + entry.score);
+      if (entry.score > 0) {
+        sentenceHitsByPackage.set(entry.package_id, (sentenceHitsByPackage.get(entry.package_id) || 0) + 1);
+      }
+    }
+  }
+  const ranked = [...aggregate.entries()]
+    .map(([package_id, score]) => ({ package_id, score }))
+    .sort((a, b) => b.score - a.score);
+  const primary = ranked[0] || null;
+  const runnerUp = ranked[1] || null;
+  const total = ranked
+    .filter(r => r.score >= 2 || (primary && r.package_id === primary.package_id))
+    .reduce((sum, r) => sum + r.score, 0);
+  const strength = primary && total > 0 ? primary.score / total : 0;
+  const margin = primary ? primary.score - (runnerUp ? runnerUp.score : 0) : 0;
+  const primarySentenceCount = primary ? (sentenceHitsByPackage.get(primary.package_id) || 0) : 0;
+  const established = !!primary &&
+    primary.score >= PASSAGE_INHERITANCE_CONFIG.MIN_PASSAGE_AGGREGATE_SCORE &&
+    strength >= PASSAGE_INHERITANCE_CONFIG.MIN_PASSAGE_FRAME_STRENGTH &&
+    primarySentenceCount >= PASSAGE_INHERITANCE_CONFIG.MIN_PASSAGE_FRAME_SENTENCES;
+
+  return {
+    passage_index: passage.passage_index,
+    passage_primary_frame: primary ? primary.package_id : null,
+    passage_runner_up: runnerUp ? runnerUp.package_id : null,
+    passage_primary_score: primary ? primary.score : 0,
+    passage_runner_up_score: runnerUp ? runnerUp.score : 0,
+    passage_frame_strength: strength,
+    passage_frame_margin: margin,
+    passage_frame_sentence_count: primarySentenceCount,
+    passage_frame_status: established ? 'established' : 'unestablished',
+    aggregate_scores: ranked,
+    sentence_score_maps: sentenceScoreMaps
+  };
+}
+
+function buildPassageInheritancePlan(text) {
+  const passages = splitIntoPassagesWithSentences(text);
+  const sentenceContexts = [];
+  for (const passage of passages) {
+    const profile = establishPassageFrame(passage);
+    passage.sentences.forEach((sentence, sentenceIndex) => {
+      sentenceContexts.push({
+        passage,
+        passageProfile: profile,
+        sentence,
+        sentence_index_in_passage: sentenceIndex,
+        sentence_score_map: profile.sentence_score_maps[sentenceIndex] || new Map()
+      });
+    });
+  }
+  return { passages, sentenceContexts };
+}
+
+function findPassageContextForText(text, plan) {
+  const target = normalize(text || '');
+  if (!target || !plan) return null;
+  return (plan.sentenceContexts || []).find(ctx => {
+    const s = normalize(ctx.sentence || '');
+    return s === target || s.includes(target) || target.includes(s);
+  }) || null;
 }
 
 function isClaimLikeSentence(sentence) {
@@ -3414,6 +3562,112 @@ function assignFrameRoles(sentence, trace) {
       ? 'Primary frame chosen by strongest domain-specific cue match.'
       : 'Primary frame chosen from active packages; no domain-specific cue dominated.'
   };
+}
+
+function frameFromPackageId(sentence, trace, packageId, fallbackScore = 0) {
+  if (!packageId) return null;
+  const existing = (trace.frame_roles?.considered_frames || [])
+    .concat(trace.frame_roles?.primary_frames || [])
+    .concat(trace.frame_roles?.auxiliary_frames || [])
+    .find(f => f.package_id === packageId);
+  if (existing) return existing;
+  const pkg = LOADED_PACKAGES.find(p => p.manifest && p.manifest.package_id === packageId);
+  if (!pkg) return null;
+  const scored = frameCandidateScore(sentence, trace, pkg);
+  return Object.assign(scored, { score: Math.max(scored.score || 0, fallbackScore || 0) });
+}
+
+function filterInheritedAuxiliaryConstraints(trace, inheritedPrimaryId) {
+  if (!trace.passage_inheritance?.frame_inherited) return trace.triggered_constraints || [];
+  const activeClusterPkgIds = new Set((trace.activated_clusters || []).map(a => a.package_id));
+  return (trace.triggered_constraints || []).filter(hit => {
+    if (hit.package_id === inheritedPrimaryId) return true;
+    const attenuated = true;
+    hit.relevance_attenuated = attenuated;
+    const pkg = LOADED_PACKAGES.find(p => p.manifest && p.manifest.package_id === hit.package_id);
+    const sev = String(hit.constraint?.severity || '').toLowerCase();
+    if (isPackageSafetyCritical(pkg) && hit.constraint && hit.constraint.blocks_answer && (sev === 'critical' || sev === 'high')) return true;
+    if (!PASSAGE_INHERITANCE_CONFIG.MECHANICAL_AUX_CONSTRAINT_REQUIRES_CLUSTER) return true;
+    if (!activeClusterPkgIds.has(hit.package_id)) return false;
+    return !(hit.constraint && hit.constraint.blocks_answer);
+  });
+}
+
+function applyPassageFrameInheritance(sentence, trace, passageContext) {
+  const localRoles = assignFrameRoles(sentence, trace);
+  const localPrimary = localRoles.primary_frame || null;
+  const localPrimaryId = localPrimary?.package_id || null;
+  const profile = passageContext?.passageProfile || null;
+  const sentenceScores = passageContext?.sentence_score_map || packageScoresForSentence(sentence);
+  const passagePrimaryId = profile?.passage_primary_frame || null;
+  const localScoreEntry = localPrimaryId ? sentenceScores.get(localPrimaryId) : null;
+  const passageScoreEntry = passagePrimaryId ? sentenceScores.get(passagePrimaryId) : null;
+  const sentenceLocalScore = localScoreEntry ? localScoreEntry.score : (localPrimary?.score || 0);
+  const sentencePassageScore = passageScoreEntry ? passageScoreEntry.score : 0;
+  const established = profile && profile.passage_frame_status === 'established';
+  let frameFlipAttempted = false;
+  let frameFlipAllowed = false;
+  let frameFlipReason = established ? 'local primary matches passage frame' : 'passage frame unestablished';
+  let finalPrimaryId = localPrimaryId;
+
+  if (established && passagePrimaryId && localPrimaryId !== passagePrimaryId) {
+    frameFlipAttempted = !!localPrimaryId;
+    frameFlipAllowed = sentenceLocalScore >= sentencePassageScore + PASSAGE_INHERITANCE_CONFIG.FLIP_MARGIN &&
+      sentenceLocalScore >= PASSAGE_INHERITANCE_CONFIG.MIN_FLIP_ABSOLUTE_SCORE;
+    if (frameFlipAllowed) {
+      frameFlipReason = 'exceeded margin';
+      finalPrimaryId = localPrimaryId;
+    } else {
+      frameFlipReason = 'below margin, inherited passage frame';
+      finalPrimaryId = passagePrimaryId;
+    }
+  }
+
+  const finalPrimary = frameFromPackageId(sentence, trace, finalPrimaryId, finalPrimaryId === passagePrimaryId ? sentencePassageScore : sentenceLocalScore);
+  const considered = localRoles.considered_frames || [];
+  const auxById = new Map();
+  for (const f of considered) {
+    if (f.package_id !== finalPrimaryId) auxById.set(f.package_id, Object.assign({}, f, {
+      relevance_attenuated: established && finalPrimaryId === passagePrimaryId && f.package_id !== passagePrimaryId && f.package_id === localPrimaryId && !frameFlipAllowed
+    }));
+  }
+  if (localPrimary && localPrimary.package_id !== finalPrimaryId) {
+    auxById.set(localPrimary.package_id, Object.assign({}, localPrimary, {
+      relevance_attenuated: established && finalPrimaryId === passagePrimaryId && !frameFlipAllowed
+    }));
+  }
+
+  const inherited = established && finalPrimaryId === passagePrimaryId && localPrimaryId !== passagePrimaryId && !frameFlipAllowed;
+  trace.passage_inheritance = {
+    passage_primary_frame: passagePrimaryId,
+    passage_runner_up: profile?.passage_runner_up || null,
+    passage_frame_strength: profile?.passage_frame_strength || 0,
+    passage_frame_margin: profile?.passage_frame_margin || 0,
+    passage_frame_status: profile?.passage_frame_status || 'unestablished',
+    sentence_local_primary: localPrimaryId,
+    sentence_local_score: sentenceLocalScore,
+    sentence_passage_score: sentencePassageScore,
+    frame_flip_attempted: frameFlipAttempted,
+    frame_flip_allowed: frameFlipAllowed,
+    frame_flip_reason: frameFlipReason,
+    frame_inherited: inherited
+  };
+
+  trace.triggered_constraints = filterInheritedAuxiliaryConstraints(trace, finalPrimaryId);
+  const rewrittenRoles = {
+    primary_frame: finalPrimary,
+    primary_frames: finalPrimary ? [finalPrimary] : [],
+    auxiliary_frames: [...auxById.values()].filter(f => f.role !== 'safety_gate'),
+    safety_frames: [...auxById.values()].filter(f => f.role === 'safety_gate'),
+    constraint_frames: [...auxById.values()].filter(f => (trace.triggered_constraints || []).some(t => t.package_id === f.package_id)),
+    suppressed_frames: localRoles.suppressed_frames || [],
+    considered_frames: finalPrimary
+      ? [finalPrimary].concat([...auxById.values()].filter(f => f.package_id !== finalPrimary.package_id))
+      : [...auxById.values()],
+    note: inherited ? 'Primary frame inherited from established passage context.' : localRoles.note
+  };
+  trace.frame_roles = rewrittenRoles;
+  return rewrittenRoles;
 }
 
 function detectPrimaryDomain(sentence, trace) {
@@ -3695,13 +3949,30 @@ function classifyClaimSentence(sentence, trace) {
   return classifyClaimSentenceDetailed(sentence, trace).verdict;
 }
 
-function appraiseClaimSentence(sentence) {
+function passageDiagnosticsFromTrace(trace) {
+  const d = trace.passage_inheritance || {};
+  return {
+    passage_primary_frame: d.passage_primary_frame || null,
+    passage_frame_strength: d.passage_frame_strength || 0,
+    passage_frame_margin: d.passage_frame_margin || 0,
+    passage_frame_status: d.passage_frame_status || 'unestablished',
+    sentence_local_primary: d.sentence_local_primary || null,
+    sentence_local_score: d.sentence_local_score || 0,
+    sentence_passage_score: d.sentence_passage_score || 0,
+    frame_flip_attempted: !!d.frame_flip_attempted,
+    frame_flip_allowed: !!d.frame_flip_allowed,
+    frame_flip_reason: d.frame_flip_reason || ''
+  };
+}
+
+function appraiseClaimSentence(sentence, passageContext = null) {
   const trace = retrieve(sentence);
-  const frame_roles = assignFrameRoles(sentence, trace);
+  const frame_roles = applyPassageFrameInheritance(sentence, trace, passageContext);
   trace.frame_roles = frame_roles;
   const detailed = classifyClaimSentenceDetailed(sentence, trace);
   const verdict = detailed.verdict;
   const display_status = claimDisplayStatus(verdict, trace, detailed.verdict_debug);
+  const passage_diagnostics = passageDiagnosticsFromTrace(trace);
   return {
     sentence,
     trace,
@@ -3717,8 +3988,22 @@ function appraiseClaimSentence(sentence) {
     active_packages: (trace.active_packages || []).map(p => p.manifest.package_id),
     active_clusters: (trace.activated_clusters || []).map(a => a.cluster.id),
     triggered_constraints: (trace.triggered_constraints || []).map(t => t.constraint.id),
+    attenuated_constraints: (trace.triggered_constraints || [])
+      .filter(t => t.relevance_attenuated)
+      .map(t => t.constraint.id),
     units: trace.units || [],
-    suggested_repair: suggestedClaimRepair(verdict, trace)
+    suggested_repair: suggestedClaimRepair(verdict, trace),
+    passage_primary_frame: passage_diagnostics.passage_primary_frame,
+    passage_frame_strength: passage_diagnostics.passage_frame_strength,
+    passage_frame_margin: passage_diagnostics.passage_frame_margin,
+    passage_frame_status: passage_diagnostics.passage_frame_status,
+    sentence_local_primary: passage_diagnostics.sentence_local_primary,
+    sentence_local_score: passage_diagnostics.sentence_local_score,
+    sentence_passage_score: passage_diagnostics.sentence_passage_score,
+    frame_flip_attempted: passage_diagnostics.frame_flip_attempted,
+    frame_flip_allowed: passage_diagnostics.frame_flip_allowed,
+    frame_flip_reason: passage_diagnostics.frame_flip_reason,
+    passage_diagnostics
   };
 }
 
@@ -3836,9 +4121,10 @@ const parseJsonFromProviderText = parseLLMJsonStrict;
 
 // Mechanical fallback path; produces the same per-claim shape as the LLM path.
 function claimsFromMechanicalSplitter(text) {
-  return splitIntoClaimSentences(text)
-    .filter(s => tokenize(s).length >= 5)
-    .map(appraiseClaimSentence);
+  const plan = buildPassageInheritancePlan(text);
+  return (plan.sentenceContexts || [])
+    .filter(ctx => tokenize(ctx.sentence).length >= 5)
+    .map(ctx => appraiseClaimSentence(ctx.sentence, ctx));
 }
 
 function buildClaimExtractionPrompt(text) {
@@ -3960,8 +4246,10 @@ function validateExtractedClaims(extraction, originalText) {
 // Appraises a single LLM-extracted claim by running TCog retrieval on the
 // canonical_claim while preserving the original_text_span for display and
 // keeping extraction metadata available in debug.
-function appraiseExtractedClaim(extracted) {
-  const appraisal = appraiseClaimSentence(extracted.canonical_claim);
+function appraiseExtractedClaim(extracted, passagePlan = null) {
+  const passageContext = findPassageContextForText(extracted.original_text_span || extracted.canonical_claim, passagePlan) ||
+    findPassageContextForText(extracted.canonical_claim, passagePlan);
+  const appraisal = appraiseClaimSentence(extracted.canonical_claim, passageContext);
   appraisal.sentence = extracted.original_text_span || extracted.canonical_claim;
   appraisal.canonical_claim = extracted.canonical_claim;
   appraisal.original_text_span = extracted.original_text_span || extracted.canonical_claim;
@@ -4258,6 +4546,83 @@ window.coversRoute = coversRoute;
 window.detectQueryClass = detectQueryClass;
 window.extractCoversTarget = extractCoversTarget;
 
+function tcogPassageInheritanceTests() {
+  const have = id => LOADED_PACKAGES.some(p => p.manifest && p.manifest.package_id === id);
+  const results = [];
+  const record = (name, ok, detail) => {
+    results.push({ name, ok, detail });
+    console.log(`${ok ? '✓' : '✗'} ${name}`, detail || '');
+  };
+  const skip = (name, why) => {
+    results.push({ name, ok: null, skipped: why });
+    console.log(`- ${name} (skipped: ${why})`);
+  };
+  const claimMatching = (appraisal, re) => (appraisal.claims || []).find(c => re.test(c.sentence || c.canonical_claim || ''));
+
+  if (have('ml_core')) {
+    const mlPassage = 'Machine learning is a computational approach to producing decision rules when the target function is unknown. In a credit-scoring example, a model learns from historical borrower data to estimate repayment risk for future applicants. In customer segmentation, learning algorithms group customers by patterns in observed behavior rather than by a hand-written rule.';
+    const a = appraiseClaimSolidity(mlPassage);
+    const credit = claimMatching(a, /credit.scoring|borrower|repayment/i);
+    const segment = claimMatching(a, /customer segmentation|group customers/i);
+    const creditOk = !!credit &&
+      credit.passage_primary_frame === 'ml_core' &&
+      credit.passage_frame_status === 'established' &&
+      (!credit.sentence_local_primary || credit.sentence_local_primary === 'ml_core' || credit.frame_flip_allowed === false) &&
+      credit.primary_frame?.package_id === 'ml_core' &&
+      credit.verdict !== 'BLOCKED';
+    record('1. ML passage credit-scoring inherits ml_core', creditOk, credit);
+    record('1b. ML passage customer segmentation primary ml_core', !!segment && segment.primary_frame?.package_id === 'ml_core', segment);
+  } else {
+    skip('1. ML passage credit-scoring', 'ml_core not loaded');
+  }
+
+  if (have('medicine_diagnostic_safety_core')) {
+    const a = appraiseClaimSolidity('The patient presents with chest pain radiating to the left arm. Initial workup should include ECG, troponins, and a chest X-ray.');
+    const ok = a.claims.length >= 2 &&
+      a.claims.every(c => c.passage_primary_frame === 'medicine_diagnostic_safety_core' && c.primary_frame?.package_id === 'medicine_diagnostic_safety_core');
+    record('2. standalone medical passage remains medicine primary', ok, a.claims);
+  } else {
+    skip('2. standalone medical passage', 'medicine_diagnostic_safety_core not loaded');
+  }
+
+  if (have('economics_core') && have('physics_dynamical_constraints_core')) {
+    const a = appraiseClaimSolidity('Opportunity cost is the value of the best alternative forgone when a choice is made. Newton\'s second law states that force equals mass times acceleration.');
+    const physics = claimMatching(a, /Newton|force equals mass/i);
+    const ok = !!physics && (
+      physics.passage_frame_status === 'unestablished' ||
+      physics.primary_frame?.package_id === 'physics_dynamical_constraints_core' ||
+      physics.frame_flip_allowed === true
+    );
+    record('3. genuine mixed-domain shift can flip to physics', ok, physics);
+  } else {
+    skip('3. mixed economics/physics passage', 'economics_core or physics_dynamical_constraints_core not loaded');
+  }
+
+  const ambiguous = appraiseClaimSolidity('Models can vary widely. Different choices lead to different outcomes.');
+  record('4. ambiguous passage remains unestablished',
+    ambiguous.claims.every(c => c.passage_frame_status === 'unestablished'), ambiguous.claims);
+
+  if (have('ml_core') && have('medicine_diagnostic_safety_core')) {
+    const a = appraiseClaimSolidity('Machine learning systems learn prediction functions from examples. Model evaluation compares predictions against observed outcomes. She reports sudden severe chest pain with shortness of breath.');
+    const chest = claimMatching(a, /chest pain|shortness of breath/i);
+    const ok = !!chest &&
+      (chest.primary_frame?.package_id === 'medicine_diagnostic_safety_core' || chest.frame_flip_allowed === true) &&
+      (chest.verdict === 'BLOCKED' || (chest.triggered_constraints || []).length > 0);
+    record('5. red-flag medicine constraint preserved', ok, chest);
+  } else {
+    skip('5. red-flag medicine constraint preserved', 'ml_core or medicine_diagnostic_safety_core not loaded');
+  }
+
+  const passed = results.filter(r => r.ok === true).length;
+  const failed = results.filter(r => r.ok === false).length;
+  const skipped = results.filter(r => r.ok === null).length;
+  console.log(`passage inheritance tests: ${passed} passed, ${failed} failed, ${skipped} skipped`);
+  return { passed, failed, skipped, results };
+}
+
+window.tcogPassageInheritanceTests = tcogPassageInheritanceTests;
+window.PASSAGE_INHERITANCE_CONFIG = PASSAGE_INHERITANCE_CONFIG;
+
 function verdictClassLabel(verdict) {
   return {
     SOLID: 'Package-supported',
@@ -4474,6 +4839,7 @@ function renderSolidityAppraisal(appraisal, repairedText = null) {
           <div style="font-size:12px; color:var(--ink-soft); margin-top:4px;">Support verdict: <code>${escapeHtml(c.display_status?.support_verdict || 'unknown')}</code></div>
           <div style="font-size:12px; color:var(--ink-soft); margin-top:4px;">Frame fit: <code>${escapeHtml(c.display_status?.frame_fit || frameFitStatusLabel(c.frame_fit?.frame_fit_status))}</code>${c.frame_fit?.reason ? ` — ${escapeHtml(c.frame_fit.reason)}` : ''}</div>
           <div style="font-size:12px; color:var(--ink-soft); margin-top:4px;">Caveat status: <code>${escapeHtml(c.display_status?.caveat_status || 'unknown')}</code></div>
+          ${renderPassageContextCell(c)}
           ${renderClaimFieldRoutingCell(c)}
           ${renderConstraintRelevanceCell(c)}
           ${renderVerdictDebug(c.verdict_debug)}
@@ -4706,7 +5072,7 @@ function buildConstraintRelevancePrompt(sentence, sentenceAppraisal) {
   const primaryId = primary ? primary.package_id : null;
   const constraintsBlock = (trace.triggered_constraints || []).map(t => {
     const c = t.constraint;
-    return `- ${c.id} [pkg ${t.package_id}] severity=${c.severity || '—'} blocks_answer=${!!c.blocks_answer} | rule: ${c.rule || ''} | repair: ${c.repair || ''}`;
+    return `- ${c.id} [pkg ${t.package_id}] severity=${c.severity || '—'} blocks_answer=${!!c.blocks_answer} relevance_attenuated=${!!t.relevance_attenuated} | rule: ${c.rule || ''} | repair: ${c.repair || ''}`;
   }).join('\n') || '(none)';
   const pkgsBlock = (trace.active_packages || [])
     .map(p => `- ${p.manifest.package_id} (${p.manifest.domain || '—'})${primaryId === p.manifest.package_id ? ' [PRIMARY]' : ''}`)
@@ -4743,6 +5109,7 @@ Rules:
 - Each constraint id must appear in exactly one category.
 - Primary-frame constraints typically belong in governing_constraints.
 - Non-primary constraints belong in relevant_auxiliary_constraints only when the sentence substantively invokes that domain frame.
+- Constraints marked relevance_attenuated=true came from a demoted non-primary frame under passage inheritance. Classify them as ignored_lexical_constraints unless the sentence clearly and substantively shifts into that domain.
 - If a non-primary constraint matched only because of overloaded generic terms (e.g. "decision rule", "function", "evidence", "design", "model", "stability"), classify it as ignored_lexical_constraints with a brief reason.
 - Do not treat ignored lexical constraints as cross-frame conflicts.
 - Critical or high blocks_answer constraints from safety-like packages should not be ignored; the validator will keep them sticky.
@@ -4947,6 +5314,30 @@ function renderClaimFieldRoutingCell(claim) {
         <div>Support depth: <code>${escapeHtml(depth)}</code></div>
         <div>${escapeHtml(claim.support_depth?.diagnosis || '')}</div>
         ${warning}
+      </div>
+    </details>
+  `;
+}
+
+function renderPassageContextCell(claim) {
+  const d = claim.passage_diagnostics || {};
+  if (!d.passage_frame_status && !claim.passage_frame_status) return '';
+  const primary = d.passage_primary_frame || claim.passage_primary_frame || 'none';
+  const status = d.passage_frame_status || claim.passage_frame_status || 'unestablished';
+  const local = d.sentence_local_primary || claim.sentence_local_primary || 'none';
+  const reason = d.frame_flip_reason || claim.frame_flip_reason || '';
+  return `
+    <details style="margin-top:8px;">
+      <summary>Passage context</summary>
+      <div style="font-size:12px; color:var(--ink-soft); margin-top:6px;">
+        <div>Passage primary: <code>${escapeHtml(primary)}</code></div>
+        <div>Status: <code>${escapeHtml(status)}</code></div>
+        <div>Strength: <code>${escapeHtml(String(Number(d.passage_frame_strength || claim.passage_frame_strength || 0).toFixed(2)))}</code></div>
+        <div>Margin: <code>${escapeHtml(String(Number(d.passage_frame_margin || claim.passage_frame_margin || 0).toFixed(2)))}</code></div>
+        <div>Sentence local primary: <code>${escapeHtml(local)}</code></div>
+        <div>Local score: <code>${escapeHtml(String(Number(d.sentence_local_score || claim.sentence_local_score || 0).toFixed(2)))}</code> · passage score: <code>${escapeHtml(String(Number(d.sentence_passage_score || claim.sentence_passage_score || 0).toFixed(2)))}</code></div>
+        <div>Flip attempted: <code>${escapeHtml(String(!!(d.frame_flip_attempted || claim.frame_flip_attempted)))}</code> · allowed: <code>${escapeHtml(String(!!(d.frame_flip_allowed || claim.frame_flip_allowed)))}</code></div>
+        <div>${escapeHtml(reason)}</div>
       </div>
     </details>
   `;
@@ -5832,7 +6223,8 @@ async function runClaimAppraisal() {
         };
         appraisal = appraiseClaimSolidity(text);
       } else {
-        const claims = extraction.claims.map(appraiseExtractedClaim);
+        const passagePlan = buildPassageInheritancePlan(text);
+        const claims = extraction.claims.map(claim => appraiseExtractedClaim(claim, passagePlan));
         appraisal = buildSolidityAppraisalRecord(text, claims);
         appraisal.extraction_used = 'llm';
         appraisal.extraction_warnings = extraction.warnings || [];
