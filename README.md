@@ -2,6 +2,8 @@
 
 **Trajectory Cognition (TCog)** is an experimental framework for turning static knowledge into an active, frame-aware cognitive architecture.
 
+[![License](https://img.shields.io/badge/License-MIT-orange.svg)](https://spdx.org/licenses/MIT.html)
+
 Instead of treating AI reasoning as isolated query-response events, TCog organizes knowledge into **basis packages**: structured bundles of anchored units, clusters, constraints, trajectories, relations, and tests. A TCog system does not merely retrieve relevant text. It asks:
 
 - Which frame is active?
