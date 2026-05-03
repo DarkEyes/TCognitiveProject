@@ -34,6 +34,8 @@
       <p class="mode-panel-note">Mechanically checks claim support, constraints, and frame fit using the loaded TCog packages.</p>
       <div class="controls">
         <button class="btn" id="appraise-claim">Run solidity appraisal</button>
+        <label class="audit-toggle"><input type="checkbox" id="solidity-llm-claim-extraction" checked> Use LLM claim extraction</label>
+        <label class="audit-toggle"><input type="checkbox" id="solidity-llm-relevance-filter" checked> Use LLM relevance filter for non-primary constraints</label>
         <label class="audit-toggle"><input type="checkbox" id="solidity-llm-summary"> Add readable LLM summary</label>
         <button class="btn btn-secondary" id="summarize-appraisal" disabled>Summarize appraisal with LLM</button>
         <button class="btn btn-secondary" id="draft-repaired" disabled>Draft repaired version</button>
@@ -59,8 +61,8 @@
         <button class="btn btn-secondary" id="flat-baseline">Compare flat retrieval baseline</button>
         <button class="btn btn-secondary" id="clear-ask">Clear</button>
         <div class="mode-toggle">
-          <label><input type="radio" name="mode" value="mechanical" checked><span>Mechanical retrieval only</span></label>
-          <label><input type="radio" name="mode" value="semantic_augmented"><span>Mechanical retrieval + LLM composition</span></label>
+          <label><input type="radio" name="mode" value="mechanical" checked><span>Mechanical only</span></label>
+          <label><input type="radio" name="mode" value="llm_guided"><span>LLM-guided TCog-R</span></label>
         </div>
       </div>
     </div>
@@ -124,7 +126,7 @@
 
     <div class="api-provider-panel" data-provider-panel="anthropic">
       <input type="password" class="api-key-input" id="anthropic-api-key" placeholder="Anthropic API key (sk-ant-...)">
-      <input type="text" class="api-model-input" id="anthropic-model" value="claude-sonnet-4-5" aria-label="Claude model">
+      <input type="text" class="api-model-input" id="anthropic-model" value="claude-haiku-4-5" aria-label="Claude model">
     </div>
 
     <div class="api-provider-panel" data-provider-panel="openai">
@@ -156,14 +158,14 @@
 
 <footer>
   <p>TCog-R implements <code>tcog-retrieval.md v0.3</code> mechanical mode. The retrieval engine performs cue matching, negative-cue checks, activation policy enforcement, and constraint triggering — all in JavaScript, all in your browser, all auditable. No backend. No telemetry. Packages load from the local <code>packages/</code> folder.</p>
-  <p style="margin-top: 8px;">Composition into prose is the only step where an LLM is involved. The selected provider is asked to phrase pre-retrieved content for the package-bound answer while the answer summary and full protocol trace remain grounded in the mechanical retrieval result. The LLM is not asked to retrieve, choose clusters, or judge relevance — those decisions are made mechanically.</p>
+  <p style="margin-top: 8px;">In <strong>Mechanical only</strong>, retrieval and answer rendering are fully deterministic and auditable. In <strong>LLM-guided TCog-R</strong>, the LLM helps interpret language and select among mechanically retrieved package candidates, but TCog-R packages and the mechanical constraint gate remain authoritative: the LLM cannot invent ids, override blocking constraints, or use suppressed packages.</p>
 </footer>
 
 </div>
 
 <div class="anchor-popover hidden" id="anchor-popover"></div>
 
-<script src="tcog_demo.js?v=appraisal-display-20260501b"></script>
+<script src="tcog_demo.js?v=safety-critical-20260503b"></script>
 
 </body>
 </html>

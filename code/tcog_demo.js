@@ -132,6 +132,11 @@ const PHYSICS_GRAVITY_TOKENS = [
   'near earth', 'near-earth', 'unsupported', 'accelerates', 'motion', 'force', 'mass'
 ];
 
+// Deprecated PACKAGE_PATCHES vocabulary. Used ONLY by applyPackageIntegrationPatch
+// to backfill statistics_core packages that ship without strict_domain_tokens.
+// Runtime routing logic must NOT reference this constant directly — domain
+// vocabulary belongs in package metadata. New packages should author their own
+// strict_domain_tokens in the manifest instead.
 const STATISTICS_CUE_TOKENS = [
   'statistics', 'statistical', 't-test', 't test', 'ttest',
   'hypothesis test', 'null hypothesis', 'alternative hypothesis',
@@ -252,9 +257,14 @@ function queryIsNormativeOrEthical(query) {
   return query && /\b(should|ought|moral|morally|ethical|ethics|fair|fairness|justice|right|wrong|value|values|legitimate|good|bad)\b/i.test(query);
 }
 
-function hasStatisticsDomainCue(query) {
-  const queryNorm = normalize(query);
-  return STATISTICS_CUE_TOKENS.some(cue => phraseMatchInQuery(cue, queryNorm));
+// Generic: does the query mention any of this package's authored strict-domain
+// tokens? Domain vocabulary lives in package metadata; runtime logic stays
+// generic.
+function queryHitsPackageDomainTokens(query, pkg) {
+  const tokens = getStrictDomainTokens(pkg);
+  if (!tokens || tokens.length === 0) return false;
+  const queryNorm = normalize(query || '');
+  return tokens.some(t => phraseMatchInQuery(t, queryNorm));
 }
 
 function getPackageRole(query, pkg) {
@@ -264,7 +274,9 @@ function getPackageRole(query, pkg) {
 
   const id = pkg.manifest?.package_id || '';
   if (id === 'math_proof_core') return 'auxiliary_checker';
-  if (id === 'statistics_core') return hasStatisticsDomainCue(query) ? 'primary_domain' : 'auxiliary_checker';
+  // Generic: a method-frame package becomes primary only when its own strict
+  // domain tokens appear in the query.
+  if (id === 'statistics_core') return queryHitsPackageDomainTokens(query, pkg) ? 'primary_domain' : 'auxiliary_checker';
   if (id === 'philosophy_ethics_core') return queryIsNormativeOrEthical(query) ? 'primary_domain' : 'auxiliary_checker';
   if (id === 'physics_dynamical_constraints_core') return 'primary_domain';
   if (id === 'chemistry_interactions_core') return 'primary_domain';
@@ -575,41 +587,68 @@ function loadUnitsForPackage(activatedClusters, pkg) {
 // ---------------------------------------------------------------------------
 // Step 4: Check constraints per package
 // ---------------------------------------------------------------------------
-function checkConstraintsInPackage(query, activatedClusters, pkg) {
+// Constraint firing policy (TCog Protocol v0.3.1, fixed 2026-05-03):
+// A constraint fires when AND ONLY when at least one of:
+//   1. one of its `trigger_cues` phrase-matches the query, OR
+//   2. it is structurally implicated by an active trajectory (the trajectory's
+//      `constraints` array names this constraint id).
+// `related_clusters` membership and `applies_to` no longer drive firing on
+// their own — they were over-firing constraints unrelated to the query when
+// any cluster in the package activated. Both fields remain on the constraint
+// object for documentation / audit; this just stops them from acting as fire
+// triggers.
+function checkConstraintsInPackage(query, activatedClusters, pkg, activeTrajectoryConstraintIds) {
   const queryNorm = normalize(query);
-  const activeClusterIds = new Set(activatedClusters.map(a => a.cluster.id));
+  const trajImplicated = activeTrajectoryConstraintIds instanceof Set
+    ? activeTrajectoryConstraintIds
+    : new Set(activeTrajectoryConstraintIds || []);
 
   const triggered = [];
   for (const c of (pkg.constraints || [])) {
-    let triggers = false;
     const reasons = [];
 
     const triggerCues = c.trigger_cues || [];
     const cueMatches = triggerCues.filter(t => phraseMatchInQuery(t, queryNorm));
-    if (cueMatches.length > 0) {
-      triggers = true;
-      reasons.push(`cues: ${cueMatches.join(', ')}`);
-    }
+    if (cueMatches.length > 0) reasons.push(`cues: ${cueMatches.join(', ')}`);
 
-    const related = c.related_clusters || [];
-    const relatedActive = related.filter(r => activeClusterIds.has(r));
-    if (relatedActive.length > 0) {
-      triggers = true;
-      reasons.push(`active cluster: ${relatedActive[0]}`);
-    }
+    if (trajImplicated.has(c.id)) reasons.push('trajectory-implicated');
 
-    const appliesTo = c.applies_to || [];
-    const appliesMatch = appliesTo.filter(a => phraseMatchInQuery(a, queryNorm));
-    if (appliesMatch.length > 0) {
-      triggers = true;
-      reasons.push(`applies_to: ${appliesMatch.join(', ')}`);
-    }
-
-    if (triggers) {
+    if (reasons.length > 0) {
       triggered.push({ constraint: c, reasons, package_id: pkg.manifest.package_id });
     }
   }
   return triggered;
+}
+
+// True if the package the constraint hit comes from is marked
+// `safety_critical: true` in its manifest. Manifests without the flag are
+// treated as non-safety-critical (default false).
+function isPackageSafetyCritical(pkg) {
+  return !!(pkg && pkg.manifest && pkg.manifest.safety_critical === true);
+}
+
+function isSafetyCriticalConstraintHit(triggeredConstraintHit) {
+  if (!triggeredConstraintHit) return false;
+  // Hit may carry a package_id (from checkConstraintsInPackage); look up the
+  // package from LOADED_PACKAGES so we read the live manifest.
+  const pkgId = triggeredConstraintHit.package_id;
+  const pkg = pkgId
+    ? LOADED_PACKAGES.find(p => p.manifest && p.manifest.package_id === pkgId)
+    : null;
+  return isPackageSafetyCritical(pkg);
+}
+
+// Active trajectory implication: gather the set of constraint ids named by
+// any trajectory whose path/cues currently match.
+function constraintIdsImplicatedByTrajectories(matchedTrajectories) {
+  const ids = new Set();
+  for (const m of matchedTrajectories || []) {
+    const tr = m && m.trajectory;
+    if (!tr) continue;
+    const cs = tr.constraints || tr.constraint_ids || [];
+    for (const cid of cs) if (typeof cid === 'string') ids.add(cid);
+  }
+  return ids;
 }
 
 // ---------------------------------------------------------------------------
@@ -709,6 +748,7 @@ function retrieve(query) {
     active_packages: [],         // packages that contributed clusters
     suppressed_packages: [],     // packages mechanically suppressed (avoid / overreach)
     domain_coverage_gaps: [],    // primary-domain tokens matched but no clusters fired
+    covers_routing: null,        // covers pre-pass result (TCog Protocol v0.3.1 §4.4)
     frame_roles: null            // assigned after activation, before rendering
   };
 
@@ -716,6 +756,10 @@ function retrieve(query) {
     trace.disposition = 'no_packages_loaded';
     return trace;
   }
+
+  // Covers-routed pre-pass (definitional/procedural queries only). Skipped
+  // cleanly for other query classes and for pipelines without covers metadata.
+  trace.covers_routing = coversRoute(query);
 
   // Step 1+2: Per-package routing and cluster activation
   const allActivated = [];
@@ -785,6 +829,13 @@ function retrieve(query) {
 
   // Track which packages contributed
   const activePkgIds = new Set(trace.activated_clusters.map(a => a.package_id));
+  // Covers-routed packages augment the candidate set even if no cluster fired
+  // for them — covers explicitly addresses the cue-based blind spot for bare
+  // definitional phrasings. avoid_when has already excluded suppressed packages
+  // in coversRoute(), so this is safe.
+  if (trace.covers_routing && trace.covers_routing.matches.length) {
+    for (const m of trace.covers_routing.matches) activePkgIds.add(m.package_id);
+  }
   trace.active_packages = LOADED_PACKAGES.filter(p => activePkgIds.has(p.manifest.package_id));
 
   // Step 3: Load units from each package's contributing clusters
@@ -794,15 +845,8 @@ function retrieve(query) {
     trace.units.push(...units);
   }
 
-  // Step 4: Check constraints per package using the active clusters from that package
-  for (const pkg of LOADED_PACKAGES) {
-    const pkgActivated = trace.activated_clusters.filter(a => a.package_id === pkg.manifest.package_id);
-    if (pkgActivated.length === 0) continue;
-    const triggered = checkConstraintsInPackage(query, pkgActivated, pkg);
-    trace.triggered_constraints.push(...triggered);
-  }
-
-  // Step 5: Match trajectories per package
+  // Step 4 (was 5): Match trajectories per package — runs BEFORE constraint
+  // checking so trajectory-implicated constraint ids can drive firing.
   for (const pkg of LOADED_PACKAGES) {
     const pkgActivated = trace.activated_clusters.filter(a => a.package_id === pkg.manifest.package_id);
     if (pkgActivated.length === 0) continue;
@@ -811,6 +855,17 @@ function retrieve(query) {
   }
   trace.matched_trajectories.sort((a, b) => b.score - a.score);
   trace.matched_trajectories = trace.matched_trajectories.slice(0, 2);  // up to 2 across packages
+  const trajectoryImplicatedConstraintIds = constraintIdsImplicatedByTrajectories(trace.matched_trajectories);
+
+  // Step 5 (was 4): Check constraints per package — fires only on trigger_cue
+  // match against the query or on trajectory implication. Active-cluster
+  // membership alone does NOT fire a constraint (TCog Protocol v0.3.1 fix).
+  for (const pkg of LOADED_PACKAGES) {
+    const pkgActivated = trace.activated_clusters.filter(a => a.package_id === pkg.manifest.package_id);
+    if (pkgActivated.length === 0) continue;
+    const triggered = checkConstraintsInPackage(query, pkgActivated, pkg, trajectoryImplicatedConstraintIds);
+    trace.triggered_constraints.push(...triggered);
+  }
 
   // Step 6: Frame issues per package
   for (const pkg of LOADED_PACKAGES) {
@@ -835,6 +890,11 @@ function retrieve(query) {
 
   // Determine response disposition
   const blocking = trace.triggered_constraints.filter(t => t.constraint.blocks_answer);
+  // Safety-critical block detection: a blocking constraint from a package
+  // whose manifest has `safety_critical: true` cannot be user-overridden.
+  trace.safety_critical_blocked = blocking.some(t => isSafetyCriticalConstraintHit(t));
+  trace.bypassed_blocking_constraints = []; // populated only on user override
+  trace.user_overridden = false;
   const allAvoided = trace.routing_per_package.length > 0 &&
                      trace.routing_per_package.every(r => r.classification === 'avoid');
   const noClusters = trace.activated_clusters.length === 0;
@@ -1579,7 +1639,7 @@ async function composeWithAnthropic(query, trace, apiKey, model) {
       'anthropic-dangerous-direct-browser-access': 'true'
     },
     body: JSON.stringify({
-      model: model || 'claude-opus-4-5',
+      model: model || 'claude-haiku-4-5',
       max_tokens: COMPOSITION_MAX_OUTPUT_TOKENS,
       system: systemPrompt,
       messages: [{ role: 'user', content: userPrompt }]
@@ -1607,7 +1667,7 @@ async function normalWithAnthropic(query, apiKey, model) {
       'anthropic-dangerous-direct-browser-access': 'true'
     },
     body: JSON.stringify({
-      model: model || 'claude-opus-4-5',
+      model: model || 'claude-haiku-4-5',
       max_tokens: COMPOSITION_MAX_OUTPUT_TOKENS,
       system: systemPrompt,
       messages: [{ role: 'user', content: userPrompt }]
@@ -1818,7 +1878,7 @@ async function generatePromptWithProvider(provider, systemPrompt, userPrompt, ap
       'anthropic-dangerous-direct-browser-access': 'true'
     },
     body: JSON.stringify({
-      model: model || 'claude-sonnet-4-5',
+      model: model || 'claude-haiku-4-5',
       max_tokens: COMPOSITION_MAX_OUTPUT_TOKENS,
       system: systemPrompt,
       messages: [{ role: 'user', content: userPrompt }]
@@ -1826,6 +1886,923 @@ async function generatePromptWithProvider(provider, systemPrompt, userPrompt, ap
   });
   if (!response.ok) throw new Error(`API error (${response.status}): ${await parseProviderError(response)}`);
   return (await response.json()).content.map(b => b.text || '').join('\n');
+}
+
+// ============================================================================
+// LLM-guided TCog-R pipeline
+// ============================================================================
+// Pipeline: query → query understanding → broad mechanical candidate retrieval
+// → LLM candidate selection → mechanical validation → constraint gate → answer.
+//
+// LLM interprets language and selects among candidates; TCog-R packages and
+// constraint gates remain authoritative. The LLM may NOT retrieve from training
+// memory, invent ids, override blocks_answer constraints, or use suppressed
+// packages as evidence.
+// ============================================================================
+
+// Robust JSON extraction: providers sometimes wrap JSON in code fences or add
+// preface text. Returns a parsed object or throws.
+function parseLLMJsonStrict(text) {
+  if (!text) throw new Error('Empty LLM response.');
+  let trimmed = String(text).trim();
+  const fence = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fence) trimmed = fence[1].trim();
+  try {
+    return JSON.parse(trimmed);
+  } catch (_) {
+    const first = trimmed.indexOf('{');
+    const last = trimmed.lastIndexOf('}');
+    if (first >= 0 && last > first) {
+      return JSON.parse(trimmed.slice(first, last + 1));
+    }
+    throw new Error('LLM response was not valid JSON.');
+  }
+}
+
+// ---------- TASK 2: query understanding ----------
+function buildQueryUnderstandingPrompt(query) {
+  const systemPrompt = `You are the query-understanding layer for TCog-R. Your job is to propose retrieval guidance only. Do not answer the user. Do not add external facts. Do not invent package ids. Return JSON only.`;
+  const userPrompt = `User query:
+${query}
+
+Return ONLY a JSON object with this exact shape (no prose, no code fences):
+
+{
+  "interpreted_query": "",
+  "domain_hints": [],
+  "must_include_terms": [],
+  "must_exclude_frames": [],
+  "auxiliary_checks": [],
+  "search_queries": []
+}
+
+Field guidance:
+- interpreted_query: a concise restatement of what the user is asking.
+- domain_hints: short domain labels you think are relevant (e.g. "healthcare policy", "ethics", "statistics"). Use natural language; do not invent package ids.
+- must_include_terms: keywords or phrases that should drive retrieval (lowercase preferred).
+- must_exclude_frames: domain labels that would be misleading here (e.g. "art aesthetics" for a healthcare query).
+- auxiliary_checks: side checks the answer should consider (e.g. "fairness", "uncertainty").
+- search_queries: 1–4 alternative phrasings to broaden mechanical retrieval. Each should be a complete short phrase.
+
+Return JSON only.`;
+  return { systemPrompt, userPrompt };
+}
+
+// ---------- TASK 3: broad mechanical candidate retrieval ----------
+function mergeCandidateById(target, items, key = 'id') {
+  for (const item of items || []) {
+    const k = item && item[key];
+    if (!k) continue;
+    if (!target.some(x => x[key] === k)) target.push(item);
+  }
+}
+
+function flattenConstraints(trace) {
+  return (trace.triggered_constraints || []).map(t => {
+    const pkg = LOADED_PACKAGES.find(p => p.manifest.package_id === t.package_id);
+    return {
+      id: t.constraint.id,
+      label: t.constraint.label || '',
+      rule: t.constraint.rule || '',
+      repair: t.constraint.repair || '',
+      severity: t.constraint.severity || '',
+      blocks_answer: !!t.constraint.blocks_answer,
+      package_id: t.package_id,
+      safety_critical: isPackageSafetyCritical(pkg)
+    };
+  });
+}
+
+function flattenUnits(trace) {
+  return (trace.units || []).map(u => ({
+    id: u.id,
+    label: u.label || '',
+    definition: u.definition || '',
+    package_id: unitPackageId(u),
+    anchors: u.anchors || []
+  }));
+}
+
+function flattenClusters(trace) {
+  return (trace.activated_clusters || []).map(a => ({
+    id: a.cluster.id,
+    label: a.cluster.label || '',
+    package_id: a.package_id,
+    score: a.score,
+    cues: a.positive_matches || []
+  }));
+}
+
+function flattenTrajectories(trace) {
+  return (trace.matched_trajectories || []).map(t => ({
+    id: t.trajectory.id,
+    label: t.trajectory.label || '',
+    score: t.score,
+    output_template: t.trajectory.output_template || []
+  }));
+}
+
+function flattenPackages(trace) {
+  return (trace.active_packages || []).map(p => ({
+    id: p.manifest.package_id,
+    domain: p.manifest.domain || ''
+  }));
+}
+
+function flattenSuppressed(trace) {
+  return (trace.suppressed_packages || []).map(s => ({
+    package_id: s.package_id,
+    domain: s.domain || '',
+    reason: s.reason,
+    detail: s.detail
+  }));
+}
+
+function flattenFrameIssues(trace) {
+  return (trace.frame_issues || []).map(i => ({
+    kind: i.kind,
+    message: i.message
+  }));
+}
+
+function retrieveWithGuidance(query, guidance) {
+  const baseTrace = retrieve(query);
+  const traces = [baseTrace];
+  const seenQueries = new Set([normalize(query || '')]);
+  const searchQueries = Array.isArray(guidance?.search_queries) ? guidance.search_queries : [];
+  for (const sq of searchQueries) {
+    if (typeof sq !== 'string') continue;
+    const normSq = normalize(sq);
+    if (!normSq || seenQueries.has(normSq)) continue;
+    seenQueries.add(normSq);
+    traces.push(retrieve(sq));
+  }
+
+  const payload = {
+    query,
+    guidance: guidance || {},
+    candidate_packages: [],
+    candidate_clusters: [],
+    candidate_units: [],
+    candidate_constraints: [],
+    candidate_trajectories: [],
+    suppressed_packages: [],
+    frame_issues: [],
+    covers_matches: [],
+    covers_query_class: null,
+    covers_target: null,
+    mechanical_traces: []
+  };
+
+  for (const t of traces) {
+    mergeCandidateById(payload.candidate_packages, flattenPackages(t), 'id');
+    mergeCandidateById(payload.candidate_clusters, flattenClusters(t), 'id');
+    mergeCandidateById(payload.candidate_units, flattenUnits(t), 'id');
+    mergeCandidateById(payload.candidate_constraints, flattenConstraints(t), 'id');
+    mergeCandidateById(payload.candidate_trajectories, flattenTrajectories(t), 'id');
+    for (const s of flattenSuppressed(t)) {
+      if (!payload.suppressed_packages.some(x => x.package_id === s.package_id && x.reason === s.reason)) {
+        payload.suppressed_packages.push(s);
+      }
+    }
+    for (const f of flattenFrameIssues(t)) {
+      if (!payload.frame_issues.some(x => x.kind === f.kind && x.message === f.message)) {
+        payload.frame_issues.push(f);
+      }
+    }
+    if (t.covers_routing && t.covers_routing.matches) {
+      if (!payload.covers_query_class) payload.covers_query_class = t.covers_routing.query_class;
+      if (!payload.covers_target) payload.covers_target = t.covers_routing.target;
+      for (const m of t.covers_routing.matches) {
+        const exists = payload.covers_matches.some(x =>
+          x.package_id === m.package_id && x.concept === m.concept && x.role === m.role);
+        if (!exists) {
+          payload.covers_matches.push({
+            package_id: m.package_id,
+            concept: m.concept,
+            scope: m.scope || '',
+            role: m.role,
+            source: m.source
+          });
+        }
+      }
+    }
+    payload.mechanical_traces.push(t);
+  }
+  // Make sure every covers-matched package is represented in candidate_packages,
+  // even if no cluster fired for it (covers' whole purpose is the cue blind spot).
+  for (const m of payload.covers_matches) {
+    if (!payload.candidate_packages.some(p => p.id === m.package_id)) {
+      const pkg = LOADED_PACKAGES.find(p => p.manifest.package_id === m.package_id);
+      payload.candidate_packages.push({
+        id: m.package_id,
+        domain: (pkg && pkg.manifest && pkg.manifest.domain) || ''
+      });
+    }
+  }
+  return payload;
+}
+
+// ---------- TASK 4: LLM candidate-selection prompt ----------
+function buildCandidateSelectionPrompt(query, candidatePayload) {
+  const pkgList = (candidatePayload.candidate_packages || [])
+    .map(p => `- ${p.id} (${p.domain || '—'})`).join('\n') || '(none)';
+  const clusterList = (candidatePayload.candidate_clusters || [])
+    .map(c => `- ${c.id} [pkg ${c.package_id}] score ${c.score}: ${c.label}`).join('\n') || '(none)';
+  const unitList = (candidatePayload.candidate_units || [])
+    .map(u => `- ${u.id} [pkg ${u.package_id}]: ${u.label} — ${u.definition}`).join('\n') || '(none)';
+  const constraintList = (candidatePayload.candidate_constraints || [])
+    .map(c => `- ${c.id} [pkg ${c.package_id}] blocks_answer=${c.blocks_answer} severity=${c.severity}: ${c.rule}`).join('\n') || '(none)';
+  const trajectoryList = (candidatePayload.candidate_trajectories || [])
+    .map(t => `- ${t.id}: ${t.label} (score ${t.score})`).join('\n') || '(none)';
+  const suppressedList = (candidatePayload.suppressed_packages || [])
+    .map(s => `- ${s.package_id} [${s.reason}] ${s.detail || ''}`).join('\n') || '(none)';
+  const guidance = candidatePayload.guidance || {};
+  const guidanceBlock = JSON.stringify({
+    interpreted_query: guidance.interpreted_query || '',
+    domain_hints: guidance.domain_hints || [],
+    must_include_terms: guidance.must_include_terms || [],
+    must_exclude_frames: guidance.must_exclude_frames || [],
+    auxiliary_checks: guidance.auxiliary_checks || []
+  }, null, 2);
+
+  const systemPrompt = `You are the candidate-selection layer for TCog-R. You select among already-retrieved package objects. You must NOT use external knowledge, invent ids, or retrieve anything from your own memory. You may only choose ids that appear in the candidate payload below. Return JSON only.`;
+
+  const coversBlock = (candidatePayload.covers_matches || [])
+    .map(m => `- ${m.package_id} [${m.role}] concept="${m.concept}"${m.scope ? ` scope="${m.scope}"` : ''}`)
+    .join('\n') || '(none)';
+  const coversHeader = candidatePayload.covers_target
+    ? `Covers-routed pre-pass (query_class=${candidatePayload.covers_query_class || 'definitional'}, target="${candidatePayload.covers_target}"). Multiple package matches with different scope qualifiers are legitimate and the architecture supports surfacing all of them; pick whichever frame fits the user's intent best, or several as primary/auxiliary.`
+    : 'Covers-routed pre-pass: not applicable for this query.';
+
+  const userPrompt = `User query:
+${query}
+
+Query-understanding guidance:
+${guidanceBlock}
+
+${coversHeader}
+Covers matches:
+${coversBlock}
+
+Candidate packages:
+${pkgList}
+
+Candidate clusters:
+${clusterList}
+
+Candidate units (the only units that may appear in selected_units):
+${unitList}
+
+Candidate constraints (the only constraints that may appear in selected_constraints / blocking_constraints):
+${constraintList}
+
+Candidate trajectories:
+${trajectoryList}
+
+Suppressed packages (NOT eligible as evidence):
+${suppressedList}
+
+Rules:
+- Use only ids that appear above. Do NOT invent ids.
+- Drop irrelevant candidates explicitly via dropped_frames.
+- Choose primary_frames and auxiliary_frames from candidate_packages only.
+- selected_units must be a subset of the candidate units list.
+- selected_constraints must be a subset of the candidate constraints list.
+- If any candidate constraint has blocks_answer=true and is relevant, include it in blocking_constraints.
+- Suppressed packages must NOT be selected as evidence.
+- If no adequate package support exists for the query, list specific issues in coverage_gaps.
+- Do NOT use external knowledge. Do NOT answer the user here.
+
+Return ONLY a JSON object with this exact shape:
+
+{
+  "primary_frames": [],
+  "auxiliary_frames": [],
+  "dropped_frames": [
+    {"package_id": "", "reason": ""}
+  ],
+  "selected_units": [],
+  "selected_constraints": [],
+  "selected_trajectory": null,
+  "blocking_constraints": [],
+  "coverage_gaps": [],
+  "answer_plan": [],
+  "selection_rationale": ""
+}
+
+Where primary_frames, auxiliary_frames are arrays of package_id strings; selected_units, selected_constraints, blocking_constraints are arrays of unit/constraint id strings; selected_trajectory is a trajectory id string or null; coverage_gaps and answer_plan are arrays of short strings; dropped_frames is an array of {package_id, reason} objects.`;
+  return { systemPrompt, userPrompt };
+}
+
+// ---------- TASK 5: mechanical validation ----------
+function validateLLMSelection(selection, candidatePayload) {
+  const warnings = [];
+  const candidatePkgIds = new Set((candidatePayload.candidate_packages || []).map(p => p.id));
+  const candidateUnitIds = new Set((candidatePayload.candidate_units || []).map(u => u.id));
+  const candidateConstraintIds = new Set((candidatePayload.candidate_constraints || []).map(c => c.id));
+  const candidateTrajectoryIds = new Set((candidatePayload.candidate_trajectories || []).map(t => t.id));
+  const suppressedIds = new Set((candidatePayload.suppressed_packages || []).map(s => s.package_id));
+
+  const filterIds = (label, items, allowed) => {
+    const kept = [];
+    for (const id of items || []) {
+      if (typeof id !== 'string') {
+        warnings.push(`${label}: dropped non-string entry`);
+        continue;
+      }
+      if (!allowed.has(id)) {
+        warnings.push(`${label}: unknown id "${id}" not in candidate payload — dropped`);
+        continue;
+      }
+      kept.push(id);
+    }
+    return kept;
+  };
+
+  const filterPkgs = (label, items) => {
+    const kept = filterIds(label, items, candidatePkgIds);
+    return kept.filter(id => {
+      if (suppressedIds.has(id)) {
+        warnings.push(`${label}: package "${id}" is suppressed — cannot be used as evidence`);
+        return false;
+      }
+      return true;
+    });
+  };
+
+  const primary_frames = filterPkgs('primary_frames', selection.primary_frames);
+  const auxiliary_frames = filterPkgs('auxiliary_frames', selection.auxiliary_frames);
+  const selected_units_pre = filterIds('selected_units', selection.selected_units, candidateUnitIds);
+  // drop units belonging to suppressed packages
+  const selected_units = selected_units_pre.filter(uid => {
+    const unit = (candidatePayload.candidate_units || []).find(u => u.id === uid);
+    if (unit && suppressedIds.has(unit.package_id)) {
+      warnings.push(`selected_units: unit "${uid}" belongs to suppressed package "${unit.package_id}" — dropped`);
+      return false;
+    }
+    return true;
+  });
+  const selected_constraints = filterIds('selected_constraints', selection.selected_constraints, candidateConstraintIds);
+
+  // Force-include any mechanically blocking constraint, even if LLM omitted it.
+  const llmBlocking = filterIds('blocking_constraints', selection.blocking_constraints, candidateConstraintIds);
+  const mechBlocking = (candidatePayload.candidate_constraints || []).filter(c => c.blocks_answer).map(c => c.id);
+  const blocking_constraints = Array.from(new Set([...llmBlocking, ...mechBlocking]));
+  for (const id of mechBlocking) {
+    if (!llmBlocking.includes(id)) {
+      warnings.push(`blocking_constraints: mechanically triggered "${id}" was missing from LLM output — added back`);
+    }
+  }
+
+  let selected_trajectory = null;
+  if (selection.selected_trajectory && typeof selection.selected_trajectory === 'string') {
+    if (candidateTrajectoryIds.has(selection.selected_trajectory)) {
+      selected_trajectory = selection.selected_trajectory;
+    } else {
+      warnings.push(`selected_trajectory: unknown id "${selection.selected_trajectory}" — dropped`);
+    }
+  }
+
+  const dropped_frames = Array.isArray(selection.dropped_frames)
+    ? selection.dropped_frames.filter(d => d && typeof d === 'object' && typeof d.package_id === 'string')
+    : [];
+
+  const coverage_gaps = (Array.isArray(selection.coverage_gaps) ? selection.coverage_gaps : []).filter(g => typeof g === 'string');
+  const answer_plan = (Array.isArray(selection.answer_plan) ? selection.answer_plan : []).filter(s => typeof s === 'string');
+  const selection_rationale = typeof selection.selection_rationale === 'string' ? selection.selection_rationale : '';
+
+  // Coverage gap: if all selected units were dropped during validation, surface it.
+  if ((selection.selected_units || []).length > 0 && selected_units.length === 0) {
+    coverage_gaps.push('All LLM-selected units were dropped during validation (unknown ids or suppressed packages).');
+  }
+
+  return {
+    primary_frames,
+    auxiliary_frames,
+    dropped_frames,
+    selected_units,
+    selected_constraints,
+    selected_trajectory,
+    blocking_constraints,
+    coverage_gaps,
+    answer_plan,
+    selection_rationale,
+    validation_warnings: warnings
+  };
+}
+
+// ---------- TASK 6: mechanical constraint gate ----------
+function applyConstraintGate(validatedSelection, candidatePayload) {
+  const blocking = validatedSelection.blocking_constraints || [];
+  const hasUnits = (validatedSelection.selected_units || []).length > 0;
+  const hasCandidates =
+    (candidatePayload.candidate_packages || []).length > 0 ||
+    (candidatePayload.candidate_clusters || []).length > 0 ||
+    (candidatePayload.candidate_units || []).length > 0;
+
+  let disposition;
+  if (blocking.length > 0) {
+    disposition = 'blocked_by_constraint';
+  } else if (hasUnits) {
+    disposition = 'selection_grounded_answer';
+  } else if (hasCandidates) {
+    disposition = 'coverage_gap';
+  } else {
+    disposition = 'no_package_support';
+  }
+
+  // Build repair questions from mechanical constraint metadata; the LLM never
+  // authors these.
+  const repair_questions = [];
+  // Safety-critical detection: any blocking constraint from a package whose
+  // manifest has safety_critical=true forces the gate closed (no override).
+  let safety_critical_blocked = false;
+  const safety_critical_blocking = [];
+  for (const cid of blocking) {
+    const c = (candidatePayload.candidate_constraints || []).find(x => x.id === cid);
+    if (c && c.repair) repair_questions.push({ constraint_id: cid, repair: c.repair });
+    if (c && c.safety_critical) {
+      safety_critical_blocked = true;
+      safety_critical_blocking.push(cid);
+    }
+  }
+
+  return {
+    disposition,
+    blocking_constraints: blocking,
+    repair_questions,
+    safety_critical_blocked,
+    safety_critical_blocking,
+    user_overridden: false,
+    bypassed_blocking_constraints: []
+  };
+}
+
+// ---------- TASK 7: selection-grounded answer composition prompt ----------
+function buildSelectionGroundedCompositionPrompt(query, candidatePayload, validatedSelection, gatedResult) {
+  const unitsById = new Map((candidatePayload.candidate_units || []).map(u => [u.id, u]));
+  const constraintsById = new Map((candidatePayload.candidate_constraints || []).map(c => [c.id, c]));
+  const unitsBlock = (validatedSelection.selected_units || []).map(uid => {
+    const u = unitsById.get(uid);
+    return u ? `[${u.id}] ${u.label}: ${u.definition}` : `[${uid}] (missing)`;
+  }).join('\n') || '(none)';
+  const constraintsBlock = (validatedSelection.selected_constraints || []).map(cid => {
+    const c = constraintsById.get(cid);
+    return c ? `[${c.id}] (severity ${c.severity}, blocks=${c.blocks_answer}) ${c.rule} | Repair: ${c.repair}` : `[${cid}] (missing)`;
+  }).join('\n') || '(none)';
+  const blockingBlock = (gatedResult.blocking_constraints || []).map(cid => {
+    const c = constraintsById.get(cid);
+    return c ? `[${c.id}] ${c.rule} | Repair: ${c.repair}` : `[${cid}] (missing)`;
+  }).join('\n') || '(none)';
+  const droppedBlock = (validatedSelection.dropped_frames || [])
+    .map(d => `- ${d.package_id}: ${d.reason || ''}`).join('\n') || '(none)';
+  const coverageBlock = (validatedSelection.coverage_gaps || [])
+    .map(g => `- ${g}`).join('\n') || '(none)';
+  const planBlock = (validatedSelection.answer_plan || [])
+    .map(p => `- ${p}`).join('\n') || '(none)';
+
+  const dispositionGuidance = {
+    selection_grounded_answer: 'Compose a concise package-bound answer using ONLY the selected units. Cite each factual claim by appending [unit_id] using exact ids. Surface any selected constraints inline.',
+    blocked_by_constraint: 'A blocking constraint fired. Do NOT assert a direct answer. Surface the constraint, present the repair question, and explain in plain language why this query cannot be reduced to a yes/no until the repair question is answered.',
+    coverage_gap: 'No selected units passed validation. State plainly that the loaded packages do not provide adequate support, and summarise the coverage gap. Do NOT invent claims.',
+    no_package_support: 'No package candidates exist for this query. State this plainly. Do NOT answer from training memory.'
+  }[gatedResult.disposition] || '';
+
+  const systemPrompt = `You are the answer-composition layer of TCog-R. LLM interprets language and selects among candidates; TCog-R packages and constraint gates remain authoritative.
+
+ABSOLUTE RULES:
+1. Use ONLY the validated selected units below for package-supported claims. Cite each factual claim with [unit_id] using exact ids.
+2. Do NOT use dropped frames as evidence.
+3. Do NOT add external facts as package-supported claims. If a plain-language connective is helpful, mark it explicitly as "synthesis" — never invent supporting ids.
+4. Surface every blocking constraint and its repair question. The mechanical gate has already decided the disposition; you cannot override it.
+5. If coverage_gaps are present, state them; do not paper over with inferred content.
+6. Do not output a protocol trace; the UI renders it separately.
+7. Start with the answer to the user's question, not with TCog internals.
+
+Disposition: ${gatedResult.disposition}
+Disposition guidance: ${dispositionGuidance}`;
+
+  const userPrompt = `User query:
+${query}
+
+=== Validated selected units (the ONLY units you may cite) ===
+${unitsBlock}
+
+=== Selected constraints ===
+${constraintsBlock}
+
+=== Blocking constraints (mechanically authoritative) ===
+${blockingBlock}
+
+=== Dropped frames (not evidence) ===
+${droppedBlock}
+
+=== Coverage gaps ===
+${coverageBlock}
+
+=== Answer plan (LLM-proposed; treat as outline only) ===
+${planBlock}
+
+Compose the answer now in plain language. Cite [unit_id] for every package-supported claim. Surface blocking constraints with their repair questions. Do not invent ids.`;
+  return { systemPrompt, userPrompt };
+}
+
+// ---------- TASK 8: provider wrapper ----------
+async function runLLMGuidedTCogR(query, providerConfig) {
+  // Remember the provider for the user-override re-composition path.
+  LAST_LLM_GUIDED_PROVIDER = providerConfig || null;
+  const result = {
+    query,
+    guidance: null,
+    candidatePayload: null,
+    rawSelection: null,
+    validatedSelection: null,
+    gatedResult: null,
+    answerText: null,
+    errors: [],
+    fellBackToMechanical: false,
+    mechanicalSections: null,
+    mechanicalTrace: null
+  };
+
+  if (!providerConfig || !providerConfig.apiKey) {
+    result.errors.push('No provider key set; cannot run LLM-guided TCog-R.');
+    const trace = retrieve(query);
+    result.mechanicalTrace = trace;
+    result.mechanicalSections = buildRawResponse(query, trace);
+    result.fellBackToMechanical = true;
+    return result;
+  }
+
+  // 1. Query understanding
+  try {
+    const qu = buildQueryUnderstandingPrompt(query);
+    const guidanceText = await generatePromptWithProvider(
+      providerConfig.provider, qu.systemPrompt, qu.userPrompt,
+      providerConfig.apiKey, providerConfig.model
+    );
+    result.guidance = parseLLMJsonStrict(guidanceText);
+  } catch (e) {
+    result.errors.push(`Query understanding failed: ${e.message}`);
+    result.guidance = { interpreted_query: query, search_queries: [] };
+  }
+
+  // 2. Broad mechanical candidate retrieval
+  try {
+    result.candidatePayload = retrieveWithGuidance(query, result.guidance);
+  } catch (e) {
+    result.errors.push(`Candidate retrieval failed: ${e.message}`);
+  }
+
+  if (!result.candidatePayload) {
+    const trace = retrieve(query);
+    result.mechanicalTrace = trace;
+    result.mechanicalSections = buildRawResponse(query, trace);
+    result.fellBackToMechanical = true;
+    return result;
+  }
+
+  // Always keep the base mechanical trace/sections for fallback rendering.
+  const baseTrace = result.candidatePayload.mechanical_traces[0] || retrieve(query);
+  result.mechanicalTrace = baseTrace;
+  result.mechanicalSections = buildRawResponse(query, baseTrace);
+
+  // 3. LLM candidate selection
+  try {
+    const sel = buildCandidateSelectionPrompt(query, result.candidatePayload);
+    const selText = await generatePromptWithProvider(
+      providerConfig.provider, sel.systemPrompt, sel.userPrompt,
+      providerConfig.apiKey, providerConfig.model
+    );
+    result.rawSelection = parseLLMJsonStrict(selText);
+  } catch (e) {
+    result.errors.push(`Candidate selection failed: ${e.message}`);
+  }
+
+  if (!result.rawSelection) {
+    result.fellBackToMechanical = true;
+    return result;
+  }
+
+  // 4. Mechanical validation
+  result.validatedSelection = validateLLMSelection(result.rawSelection, result.candidatePayload);
+
+  // 5. Mechanical constraint gate
+  result.gatedResult = applyConstraintGate(result.validatedSelection, result.candidatePayload);
+
+  // 6. Selection-grounded answer composition
+  try {
+    const cmp = buildSelectionGroundedCompositionPrompt(
+      query, result.candidatePayload, result.validatedSelection, result.gatedResult
+    );
+    result.answerText = await generatePromptWithProvider(
+      providerConfig.provider, cmp.systemPrompt, cmp.userPrompt,
+      providerConfig.apiKey, providerConfig.model
+    );
+  } catch (e) {
+    result.errors.push(`Answer composition failed: ${e.message}`);
+  }
+
+  return result;
+}
+
+// ---------- TASK 9: render LLM-guided result ----------
+function renderListBlock(items, emptyMsg, mapFn) {
+  if (!items || items.length === 0) {
+    return `<p style="color:var(--ink-faint); font-size:13px; margin:0;"><em>${escapeHtml(emptyMsg)}</em></p>`;
+  }
+  return '<ul class="trace-list">' + items.map(mapFn).join('') + '</ul>';
+}
+
+function renderQueryUnderstandingCard(guidance) {
+  const div = document.createElement('div');
+  div.className = 'section section-A';
+  const g = guidance || {};
+  const interpreted = g.interpreted_query || '(none)';
+  const domains = renderListBlock(g.domain_hints || [], 'No domain hints.', s => `<li>${escapeHtml(s)}</li>`);
+  const searches = renderListBlock(g.search_queries || [], 'No search queries proposed.', s => `<li><code>${escapeHtml(s)}</code></li>`);
+  const exclude = renderListBlock(g.must_exclude_frames || [], 'No exclusions.', s => `<li>${escapeHtml(s)}</li>`);
+  const includes = renderListBlock(g.must_include_terms || [], 'No must-include terms.', s => `<li><code>${escapeHtml(s)}</code></li>`);
+  const aux = renderListBlock(g.auxiliary_checks || [], 'No auxiliary checks.', s => `<li>${escapeHtml(s)}</li>`);
+  div.innerHTML = `
+    <div class="section-label"><span>Query understanding (LLM)</span></div>
+    <div class="section-content">
+      <p><strong>Interpreted query:</strong> ${escapeHtml(interpreted)}</p>
+      <div class="trace-row"><div class="trace-row-label">Domain hints</div><div class="trace-row-body">${domains}</div></div>
+      <div class="trace-row"><div class="trace-row-label">Search queries</div><div class="trace-row-body">${searches}</div></div>
+      <div class="trace-row"><div class="trace-row-label">Must-include terms</div><div class="trace-row-body">${includes}</div></div>
+      <div class="trace-row"><div class="trace-row-label">Must-exclude frames</div><div class="trace-row-body">${exclude}</div></div>
+      <div class="trace-row"><div class="trace-row-label">Auxiliary checks</div><div class="trace-row-body">${aux}</div></div>
+    </div>
+  `;
+  return div;
+}
+
+function renderSelectionCard(validatedSelection, candidatePayload) {
+  const div = document.createElement('div');
+  div.className = 'section section-B';
+  const v = validatedSelection || {};
+  const primary = renderListBlock(v.primary_frames || [], 'No primary frames selected.', s => `<li><code>${escapeHtml(s)}</code></li>`);
+  const aux = renderListBlock(v.auxiliary_frames || [], 'No auxiliary frames selected.', s => `<li><code>${escapeHtml(s)}</code></li>`);
+  const dropped = renderListBlock(v.dropped_frames || [], 'No frames dropped.',
+    d => `<li><code>${escapeHtml(d.package_id)}</code> — ${escapeHtml(d.reason || '')}</li>`);
+  const unitsById = new Map((candidatePayload.candidate_units || []).map(u => [u.id, u]));
+  const units = renderListBlock(v.selected_units || [], 'No units selected.', uid => {
+    const u = unitsById.get(uid);
+    return `<li><code>${escapeHtml(uid)}</code> ${u ? '— ' + escapeHtml(u.label || '') : ''}</li>`;
+  });
+  const constraintsById = new Map((candidatePayload.candidate_constraints || []).map(c => [c.id, c]));
+  const constraints = renderListBlock(v.selected_constraints || [], 'No constraints selected.', cid => {
+    const c = constraintsById.get(cid);
+    return `<li><code>${escapeHtml(cid)}</code> ${c ? '— ' + escapeHtml(c.label || c.rule || '') : ''}</li>`;
+  });
+  const warnings = renderListBlock(v.validation_warnings || [], 'No validation warnings.', w => `<li>${escapeHtml(w)}</li>`);
+  const rationale = v.selection_rationale ? `<p style="margin:6px 0 0;">${escapeHtml(v.selection_rationale)}</p>` : '';
+  div.innerHTML = `
+    <div class="section-label"><span>LLM candidate selection (validated)</span></div>
+    <div class="section-content">
+      <div class="trace-row"><div class="trace-row-label">Primary frames</div><div class="trace-row-body">${primary}</div></div>
+      <div class="trace-row"><div class="trace-row-label">Auxiliary frames</div><div class="trace-row-body">${aux}</div></div>
+      <div class="trace-row"><div class="trace-row-label">Dropped frames</div><div class="trace-row-body">${dropped}</div></div>
+      <div class="trace-row"><div class="trace-row-label">Selected units</div><div class="trace-row-body">${units}</div></div>
+      <div class="trace-row"><div class="trace-row-label">Selected constraints</div><div class="trace-row-body">${constraints}</div></div>
+      <div class="trace-row"><div class="trace-row-label">Validation warnings</div><div class="trace-row-body">${warnings}</div></div>
+      ${rationale}
+    </div>
+  `;
+  return div;
+}
+
+function renderTcogRGuidedAnswerCard(answerText, gatedResult) {
+  const div = document.createElement('div');
+  div.className = 'section section-B';
+  let body;
+  if (answerText) {
+    let html = answerText
+      .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+      .replace(/\n\n+/g, '</p><p>')
+      .replace(/\n/g, ' ');
+    body = `<div class="section-content"><p>${renderCitations(html)}</p></div>`;
+  } else {
+    const note = gatedResult && gatedResult.disposition === 'no_package_support'
+      ? 'No package candidates were retrieved for this query.'
+      : 'Composition unavailable.';
+    body = `<div class="section-content"><p style="color:var(--ink-faint);"><em>${escapeHtml(note)}</em></p></div>`;
+  }
+  div.innerHTML = `<div class="section-label"><span>TCog-R answer (selection-grounded)</span></div>${body}`;
+  attachCitationHandlers(div);
+  return div;
+}
+
+function renderConstraintGateCard(gatedResult, candidatePayload) {
+  const div = document.createElement('div');
+  div.className = 'section section-C';
+  const constraintsById = new Map((candidatePayload.candidate_constraints || []).map(c => [c.id, c]));
+  const blockingHtml = renderListBlock(gatedResult.blocking_constraints || [], 'No blocking constraints.', cid => {
+    const c = constraintsById.get(cid);
+    const sc = c && c.safety_critical ? ' <span class="status-pill" style="background:rgba(184,92,0,0.12); color:var(--warn);">safety-critical</span>' : '';
+    return `<li><code>${escapeHtml(cid)}</code>${sc}${c ? ' — ' + escapeHtml(c.rule || '') : ''}</li>`;
+  });
+  const repairHtml = renderListBlock(gatedResult.repair_questions || [], 'No repair questions.', r =>
+    `<li><code>${escapeHtml(r.constraint_id)}</code>: ${escapeHtml(r.repair || '')}</li>`);
+
+  const dispositionBadge = gatedResult.user_overridden
+    ? `${escapeHtml(gatedResult.disposition || '—')} (user_overridden)`
+    : escapeHtml(gatedResult.disposition || '—');
+
+  // Render the one-click override button only when:
+  //   disposition === 'blocked_by_constraint' AND safety_critical_blocked === false
+  // AND the override has not already been applied to this result.
+  const showOverrideButton =
+    gatedResult.disposition === 'blocked_by_constraint' &&
+    gatedResult.safety_critical_blocked === false &&
+    !gatedResult.user_overridden;
+
+  const overrideButtonHtml = showOverrideButton
+    ? `<div style="margin-top:10px;"><button class="btn" id="override-blocking-constraint" type="button">Show answer with caveats</button></div>`
+    : '';
+
+  const safetyNoteHtml = gatedResult.safety_critical_blocked
+    ? `<p style="margin:6px 0 0; color:var(--warn); font-size:12px;"><strong>Safety-critical block:</strong> blocked by ${(gatedResult.safety_critical_blocking || []).map(escapeHtml).join(', ') || 'a safety-critical constraint'}. This package's blocking is part of the architecture (e.g. medicine/counselling/law). The user cannot override; address the constraint or rephrase.</p>`
+    : '';
+
+  const overriddenNoteHtml = gatedResult.user_overridden
+    ? `<p style="margin:6px 0 0; font-size:12px; color:var(--ink-soft);"><strong>User override applied.</strong> Bypassed: ${(gatedResult.bypassed_blocking_constraints || []).map(c => `<code>${escapeHtml(c)}</code>`).join(', ') || '(none recorded)'}.</p>`
+    : '';
+
+  div.innerHTML = `
+    <div class="section-label"><span>Mechanical constraint gate</span><span style="color:var(--ink-faint);">disposition: ${dispositionBadge}</span></div>
+    <div class="section-content">
+      <div class="trace-row"><div class="trace-row-label">Blocking constraints</div><div class="trace-row-body">${blockingHtml}${overrideButtonHtml}</div></div>
+      <div class="trace-row"><div class="trace-row-label">Repair questions</div><div class="trace-row-body">${repairHtml}</div></div>
+      ${safetyNoteHtml}
+      ${overriddenNoteHtml}
+    </div>
+  `;
+  if (showOverrideButton) {
+    const btn = div.querySelector('#override-blocking-constraint');
+    if (btn) btn.addEventListener('click', onShowAnswerWithCaveats);
+  }
+  return div;
+}
+
+// Click handler for the "Show answer with caveats" override. Reads the last
+// LLM-guided result from module state, runs an answer-with-caveats composition,
+// updates the audit trail, and re-renders. One click; no second confirmation.
+async function onShowAnswerWithCaveats() {
+  const result = LAST_LLM_GUIDED_RESULT;
+  const providerConfig = LAST_LLM_GUIDED_PROVIDER;
+  if (!result || !result.gatedResult) return;
+  if (result.gatedResult.safety_critical_blocked) return; // double-guard
+
+  const out = document.getElementById('output');
+  // Disable button while we compose; the loader replaces the card on re-render.
+  const btn = out.querySelector('#override-blocking-constraint');
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = 'Composing answer with caveats…';
+  }
+
+  const bypassed = (result.gatedResult.blocking_constraints || []).slice();
+  const overriddenGate = Object.assign({}, result.gatedResult, {
+    disposition: 'blocked_by_constraint',
+    user_overridden: true,
+    bypassed_blocking_constraints: bypassed,
+    // Compose now under selection-grounded guidance to surface caveats and answer.
+    _override_compose_disposition: 'selection_grounded_answer'
+  });
+
+  let answerText = result.answerText;
+  if (providerConfig && providerConfig.apiKey) {
+    try {
+      const cmp = buildSelectionGroundedCompositionPrompt(
+        result.query,
+        result.candidatePayload,
+        result.validatedSelection,
+        // Pass an answer-with-caveats variant so the LLM composes content,
+        // not a refusal. Surface the caveats explicitly in the prompt.
+        Object.assign({}, overriddenGate, { disposition: 'selection_grounded_answer' })
+      );
+      const cavSystem = cmp.systemPrompt + `\n\nUser-overridden block: the user has chosen to see the answer with caveats. ${bypassed.length} blocking constraint(s) are bypassed (${bypassed.join(', ')}). Begin the answer with a "Caveats" section that surfaces every bypassed constraint by id and rule, then provide the answer using only the selected units. Do not refuse.`;
+      answerText = await generatePromptWithProvider(
+        providerConfig.provider,
+        cavSystem,
+        cmp.userPrompt,
+        providerConfig.apiKey,
+        providerConfig.model
+      );
+    } catch (e) {
+      // Compose failed: keep the original drafted answer; surface a warning.
+      result.errors = result.errors || [];
+      result.errors.push(`Override composition failed: ${e.message}`);
+    }
+  }
+
+  result.gatedResult = overriddenGate;
+  result.answerText = answerText;
+  if (result.mechanicalTrace) {
+    result.mechanicalTrace.user_overridden = true;
+    result.mechanicalTrace.bypassed_blocking_constraints = bypassed;
+  }
+  renderLLMGuidedResult(result);
+}
+
+function renderCandidateTraceDetails(candidatePayload, mechanicalSections) {
+  const details = document.createElement('details');
+  details.className = 'protocol-trace';
+  const pkgs = renderListBlock(candidatePayload.candidate_packages || [], 'No candidate packages.',
+    p => `<li><code>${escapeHtml(p.id)}</code> <span style="color:var(--ink-faint);">(${escapeHtml(p.domain || '—')})</span></li>`);
+  const clusters = renderListBlock(candidatePayload.candidate_clusters || [], 'No candidate clusters.',
+    c => `<li><code>${escapeHtml(c.package_id)}:${escapeHtml(shortClusterId(c.id))}</code> <span style="color:var(--ink-faint);">score ${c.score}</span></li>`);
+  const units = renderListBlock(candidatePayload.candidate_units || [], 'No candidate units.',
+    u => `<li><code>${escapeHtml(u.id)}</code> — ${escapeHtml(u.label || '')}</li>`);
+  const constraints = renderListBlock(candidatePayload.candidate_constraints || [], 'No candidate constraints.',
+    c => `<li><code>${escapeHtml(c.id)}</code> ${c.blocks_answer ? '<strong style="color:var(--accent);">blocks</strong> · ' : ''}severity ${escapeHtml(c.severity || '—')}</li>`);
+  const suppressed = renderListBlock(candidatePayload.suppressed_packages || [], 'No suppressed packages.',
+    s => `<li><code>${escapeHtml(s.package_id)}</code> [${escapeHtml(s.reason)}] ${escapeHtml(s.detail || '')}</li>`);
+  const frameIssues = renderListBlock(candidatePayload.frame_issues || [], 'No frame issues.',
+    i => `<li>[${escapeHtml(i.kind)}] ${escapeHtml(i.message)}</li>`);
+
+  details.innerHTML = `
+    <summary>Broad mechanical candidates and full protocol trace</summary>
+    <div class="section section-A">
+      <div class="section-label"><span>Candidate trace (post-broad retrieval)</span></div>
+      <div class="section-content">
+        <div class="trace-row"><div class="trace-row-label">Candidate packages</div><div class="trace-row-body">${pkgs}</div></div>
+        <div class="trace-row"><div class="trace-row-label">Candidate clusters</div><div class="trace-row-body">${clusters}</div></div>
+        <div class="trace-row"><div class="trace-row-label">Candidate units</div><div class="trace-row-body">${units}</div></div>
+        <div class="trace-row"><div class="trace-row-label">Candidate constraints</div><div class="trace-row-body">${constraints}</div></div>
+        <div class="trace-row"><div class="trace-row-label">Suppressed packages</div><div class="trace-row-body">${suppressed}</div></div>
+        <div class="trace-row"><div class="trace-row-label">Frame issues</div><div class="trace-row-body">${frameIssues}</div></div>
+      </div>
+    </div>
+  `;
+  details.appendChild(renderProtocolTraceDetails(mechanicalSections || { sectionA_trace: null }));
+  return details;
+}
+
+function renderLLMGuidedErrorBanner(errors) {
+  if (!errors || errors.length === 0) return null;
+  const div = document.createElement('div');
+  div.className = 'section section-G';
+  div.innerHTML = `
+    <div class="section-label"><span><span class="marker">!</span>LLM-guided pipeline issues</span></div>
+    <div class="section-content"><ul class="trace-list">${errors.map(e => `<li>${escapeHtml(e)}</li>`).join('')}</ul></div>
+  `;
+  return div;
+}
+
+function renderLLMGuidedResult(result) {
+  // Stash the result so the override click handler can re-render after a
+  // recomposition without rerunning the full pipeline.
+  LAST_LLM_GUIDED_RESULT = result;
+  const out = document.getElementById('output');
+  out.innerHTML = '';
+
+  // If the pipeline could not produce a candidatePayload, fall back to mechanical only.
+  if (result.fellBackToMechanical && !result.candidatePayload) {
+    const banner = renderLLMGuidedErrorBanner(result.errors);
+    if (banner) out.appendChild(banner);
+    if (result.mechanicalTrace && result.mechanicalSections) {
+      const fallbackCovers = renderCoversCard(result.mechanicalTrace.covers_routing);
+      if (fallbackCovers) out.appendChild(fallbackCovers);
+      const summary = renderAnswerSummaryCard(result.query, result.mechanicalTrace, result.mechanicalSections);
+      out.appendChild(renderFrameRolesCard(result.mechanicalTrace));
+      out.appendChild(summary.div);
+      out.appendChild(renderPackageBoundCard(result.mechanicalSections));
+      out.appendChild(renderConstraintsCard(result.mechanicalSections));
+      out.appendChild(renderNextMoveCard(summary.next));
+      out.appendChild(renderProtocolTraceDetails(result.mechanicalSections));
+    }
+    return;
+  }
+
+  const banner = renderLLMGuidedErrorBanner(result.errors);
+  if (banner) out.appendChild(banner);
+
+  // Render the answer first — users want to see it before the supporting cards.
+  if (result.gatedResult) {
+    out.appendChild(renderTcogRGuidedAnswerCard(result.answerText, result.gatedResult));
+    out.appendChild(renderConstraintGateCard(result.gatedResult, result.candidatePayload));
+  } else if (result.fellBackToMechanical && result.mechanicalSections) {
+    // Selection step failed; show mechanical answer as fallback.
+    out.appendChild(renderPackageBoundCard(result.mechanicalSections));
+    out.appendChild(renderConstraintsCard(result.mechanicalSections));
+  }
+
+  out.appendChild(renderQueryUnderstandingCard(result.guidance));
+
+  // Surface covers matches above the LLM selection card so users can see what
+  // the covers pre-pass routed before the LLM made its choice.
+  const coversCard = renderCoversCard(result.candidatePayload);
+  if (coversCard) out.appendChild(coversCard);
+
+  if (result.validatedSelection) {
+    out.appendChild(renderSelectionCard(result.validatedSelection, result.candidatePayload));
+  }
+
+  out.appendChild(renderCandidateTraceDetails(result.candidatePayload, result.mechanicalSections));
 }
 
 // ============================================================================
@@ -2328,10 +3305,189 @@ function claimDisplayStatus(verdict, trace, debug) {
 }
 
 function appraiseClaimSolidity(text) {
-  const claims = splitIntoClaimSentences(text)
+  const claims = claimsFromMechanicalSplitter(text);
+  const record = buildSolidityAppraisalRecord(text, claims);
+  record.extraction_used = 'mechanical';
+  return record;
+}
+
+// ============================================================================
+// LLM-assisted claim extraction
+// ============================================================================
+// The mechanical sentence splitter appraises sentences in isolation, which
+// breaks on anaphora and contrastive continuation ("This distinguishes it
+// from..."). When a provider key is available, we let the LLM extract
+// coherent claims from the user's text and resolve references using only the
+// provided text. TCog packages remain the source of support; the LLM is not
+// allowed to invent ids, citations, or facts. Mechanical splitting remains
+// the audit baseline and the no-key fallback.
+// ============================================================================
+
+// Backwards-compatible alias so callers can use the suggested name.
+const parseJsonFromProviderText = parseLLMJsonStrict;
+
+// Mechanical fallback path; produces the same per-claim shape as the LLM path.
+function claimsFromMechanicalSplitter(text) {
+  return splitIntoClaimSentences(text)
     .filter(s => tokenize(s).length >= 5)
     .map(appraiseClaimSentence);
+}
 
+function buildClaimExtractionPrompt(text) {
+  const systemPrompt = `You are the claim-extraction layer for TCog-R Claim Solidity Appraisal. Your job is to extract coherent claims from the user's text and canonicalize them so each claim can be appraised in isolation. You may resolve pronouns and demonstratives ("this", "that", "it", "these", "those", "such", "the former", "the latter") using ONLY the local text. Do NOT add new facts. Do NOT evaluate the claims. Do NOT mention TCog packages. Return JSON only.`;
+
+  const userPrompt = `Original text:
+${text}
+
+Extract claims as JSON. Rules:
+- Extract coherent claims; a claim may span more than one sentence when discourse continuation requires it.
+- Preserve the author's intended meaning. Do not invent claims that are not present.
+- Resolve references ("this", "that", "it", "these", "those", "such", "former", "latter", "this distinguishes", "this implies", "this contrasts with") using ONLY the local text. If a reference cannot be resolved confidently from the text, leave it and note this in confidence_note.
+- For contrastive claims, the canonical_claim should include both sides of the contrast so it stands alone.
+- original_text_span must be a verbatim substring (or near-verbatim) of the original text.
+- canonical_claim is the standalone, reference-resolved version used for retrieval.
+- claim_type should be one of: definition, contrast, causal, normative, empirical, procedural, other.
+- depends_on_previous=true when the claim only makes sense after an earlier claim's content has been resolved into it.
+- Do not add facts, package ids, unit ids, constraints, or citations.
+
+Return ONLY a JSON object with this exact shape:
+
+{
+  "claims": [
+    {
+      "claim_id": "claim_1",
+      "original_text_span": "",
+      "canonical_claim": "",
+      "claim_type": "definition | contrast | causal | normative | empirical | procedural | other",
+      "depends_on_previous": false,
+      "resolved_references": [
+        {"original": "", "resolved_as": ""}
+      ],
+      "context_needed": "",
+      "confidence_note": ""
+    }
+  ]
+}`;
+  return { systemPrompt, userPrompt };
+}
+
+// Validation: ensures each extracted claim has the minimum fields and is
+// grounded in the original text. canonical_claim does not need to be a
+// verbatim substring (it may resolve pronouns), but it must not be wildly
+// untethered from the source. Returns { claims, warnings, ok }.
+function validateExtractedClaims(extraction, originalText) {
+  const warnings = [];
+  if (!extraction || typeof extraction !== 'object' || !Array.isArray(extraction.claims)) {
+    return { claims: [], warnings: ['extraction: missing or malformed "claims" array'], ok: false };
+  }
+
+  const originalNorm = normalize(originalText || '');
+  const originalTokens = new Set(tokenize(originalText || ''));
+  const kept = [];
+  let claimCounter = 0;
+  const seenIds = new Set();
+
+  for (const raw of extraction.claims) {
+    if (!raw || typeof raw !== 'object') {
+      warnings.push('extraction: dropped non-object claim entry');
+      continue;
+    }
+    let claim_id = typeof raw.claim_id === 'string' && raw.claim_id ? raw.claim_id : null;
+    if (!claim_id || seenIds.has(claim_id)) {
+      claim_id = `claim_${++claimCounter}`;
+      while (seenIds.has(claim_id)) claim_id = `claim_${++claimCounter}`;
+    }
+    seenIds.add(claim_id);
+
+    const canonical = typeof raw.canonical_claim === 'string' ? raw.canonical_claim.trim() : '';
+    const span = typeof raw.original_text_span === 'string' ? raw.original_text_span.trim() : '';
+
+    if (!canonical) {
+      warnings.push(`${claim_id}: empty canonical_claim — dropped`);
+      continue;
+    }
+    if (!span) {
+      warnings.push(`${claim_id}: missing original_text_span — using canonical_claim for display`);
+    }
+
+    // Soft grounding check: the canonical claim should share most content
+    // tokens with the original text. We don't require exact substring match
+    // (pronouns get resolved), but we do flag claims whose tokens look
+    // mostly disjoint from the source.
+    const claimTokens = tokenize(canonical).filter(t => t.length > 2);
+    const overlap = claimTokens.filter(t => originalTokens.has(t)).length;
+    const ratio = claimTokens.length ? overlap / claimTokens.length : 0;
+    if (ratio < 0.3) {
+      warnings.push(`${claim_id}: canonical_claim has low token overlap with original text (${overlap}/${claimTokens.length}) — may have introduced new content`);
+    }
+
+    // Span grounding: when present, the span should appear in the original.
+    if (span) {
+      const spanNorm = normalize(span);
+      if (spanNorm && !originalNorm.includes(spanNorm)) {
+        warnings.push(`${claim_id}: original_text_span not found verbatim in source — kept for display only`);
+      }
+    }
+
+    const allowedTypes = new Set(['definition', 'contrast', 'causal', 'normative', 'empirical', 'procedural', 'other']);
+    const claim_type = allowedTypes.has(raw.claim_type) ? raw.claim_type : 'other';
+
+    kept.push({
+      claim_id,
+      original_text_span: span || canonical,
+      canonical_claim: canonical,
+      claim_type,
+      depends_on_previous: !!raw.depends_on_previous,
+      resolved_references: Array.isArray(raw.resolved_references)
+        ? raw.resolved_references.filter(r => r && typeof r === 'object' && typeof r.original === 'string' && typeof r.resolved_as === 'string')
+        : [],
+      context_needed: typeof raw.context_needed === 'string' ? raw.context_needed : '',
+      confidence_note: typeof raw.confidence_note === 'string' ? raw.confidence_note : ''
+    });
+  }
+
+  return { claims: kept, warnings, ok: kept.length > 0 };
+}
+
+// Appraises a single LLM-extracted claim by running TCog retrieval on the
+// canonical_claim while preserving the original_text_span for display and
+// keeping extraction metadata available in debug.
+function appraiseExtractedClaim(extracted) {
+  const appraisal = appraiseClaimSentence(extracted.canonical_claim);
+  appraisal.sentence = extracted.original_text_span || extracted.canonical_claim;
+  appraisal.canonical_claim = extracted.canonical_claim;
+  appraisal.original_text_span = extracted.original_text_span || extracted.canonical_claim;
+  appraisal.extraction_meta = {
+    claim_id: extracted.claim_id,
+    claim_type: extracted.claim_type,
+    depends_on_previous: !!extracted.depends_on_previous,
+    resolved_references: extracted.resolved_references || [],
+    context_needed: extracted.context_needed || '',
+    confidence_note: extracted.confidence_note || ''
+  };
+  return appraisal;
+}
+
+// LLM extraction wrapper. Returns either a successful extraction record or
+// throws so the caller can fall back to mechanical splitting.
+async function runLLMClaimExtraction(text, providerConfig) {
+  const prompt = buildClaimExtractionPrompt(text);
+  const responseText = await generatePromptWithProvider(
+    providerConfig.provider,
+    prompt.systemPrompt,
+    prompt.userPrompt,
+    providerConfig.apiKey,
+    providerConfig.model
+  );
+  const parsed = parseJsonFromProviderText(responseText);
+  const validated = validateExtractedClaims(parsed, text);
+  return validated;
+}
+
+// Builds the appraisal-level summary record from per-claim results. Extracted
+// so that the LLM relevance filter can rebuild the record after mutating
+// per-claim verdicts/display_status without re-running mechanical retrieval.
+function buildSolidityAppraisalRecord(text, claims) {
   const overall = aggregateSolidityVerdict(claims);
   const overallDisplayLabel = overallDisplayLabelForClaims(overall, claims);
 
@@ -2398,6 +3554,139 @@ function debugSoliditySentence(sentence) {
 }
 
 window.debugSoliditySentence = debugSoliditySentence;
+
+// ============================================================================
+// Covers test runner (TCog Protocol v0.3.1 §4.4)
+// ============================================================================
+// Run from the browser console after loading the relevant packages:
+//   window.tcogCoversTests()                  // run all
+//   window.tcogCoversTests('what is a tree?') // ad-hoc probe
+// Tests assert routing decisions, not specific package contents — they are
+// generic over the loaded package set and skip cases when required packages
+// are not loaded, rather than failing.
+function tcogCoversTests(adHocQuery) {
+  if (typeof adHocQuery === 'string' && adHocQuery) {
+    const result = coversRoute(adHocQuery);
+    console.log('[covers] ad-hoc:', adHocQuery, result);
+    return result;
+  }
+  const have = id => LOADED_PACKAGES.some(p => p.manifest && p.manifest.package_id === id);
+  const results = [];
+  const record = (name, ok, detail) => {
+    results.push({ name, ok, detail });
+    console.log(`${ok ? '✓' : '✗'} ${name}`, detail || '');
+  };
+  const skip = (name, why) => {
+    results.push({ name, ok: null, skipped: why });
+    console.log(`- ${name} (skipped: ${why})`);
+  };
+
+  // 1. Definitional + single-package match (uses any package with covers)
+  (() => {
+    if (have('economics_core')) {
+      const r = coversRoute('what is opportunity cost?');
+      const hit = r.matches.some(m => m.package_id === 'economics_core' && /opportunity cost/i.test(m.concept));
+      record('1. definitional single-package: opportunity cost → economics_core', hit, r);
+    } else {
+      skip('1. opportunity cost', 'economics_core not loaded');
+    }
+  })();
+
+  // 2. Productive cross-package overlap
+  if (have('graph_theory_core') && have('combinatorics_discrete_structures_core')) {
+    const r = coversRoute('what is a tree?');
+    const gt = r.matches.some(m => m.package_id === 'graph_theory_core');
+    const cb = r.matches.some(m => m.package_id === 'combinatorics_discrete_structures_core');
+    record('2a. tree → both graph_theory_core AND combinatorics_discrete_structures_core', gt && cb, r);
+  } else {
+    skip('2a. tree multi-package', 'graph_theory_core or combinatorics_discrete_structures_core not loaded');
+  }
+  if (have('probability_stats_core') && have('ml_core')) {
+    const r = coversRoute('what is sampling bias?');
+    const ps = r.matches.some(m => m.package_id === 'probability_stats_core');
+    const ml = r.matches.some(m => m.package_id === 'ml_core');
+    record('2b. sampling bias → both probability_stats_core AND ml_core', ps && ml, r);
+  } else {
+    skip('2b. sampling bias multi-package', 'probability_stats_core or ml_core not loaded');
+  }
+
+  // 3. Non-definitional query: covers does NOT fire
+  (() => {
+    const r = coversRoute('how do I analyze this data?');
+    record('3. non-definitional: how do I analyze this data?',
+      r.query_class === 'procedural' || r.matches.length === 0,
+      { query_class: r.query_class, matches: r.matches.length });
+  })();
+  (() => {
+    const r = coversRoute('Compare frequentist and Bayesian inference.');
+    record('3b. non-definitional: comparative does not run covers',
+      r.query_class !== 'definitional' && r.matches.length === 0, r);
+  })();
+
+  // 4. avoid_when override
+  (() => {
+    const r = coversRoute('how should I comfort someone panicking?');
+    const technical = r.matches.filter(m => m.package_id === 'probability_stats_core' || m.package_id === 'algorithm_design_core');
+    record('4. avoid_when overrides covers (no technical packages routed)',
+      technical.length === 0, r);
+  })();
+
+  // 5. Definitional + no covers match
+  (() => {
+    const r = coversRoute('what is the Banach fixed point theorem?');
+    record('5. definitional + no covers match falls through cleanly',
+      r.query_class === 'definitional' && Array.isArray(r.matches), r);
+  })();
+
+  // 6. Bare noun-phrase definitional
+  if (have('probability_stats_core')) {
+    const r = coversRoute('Bayes factor');
+    const hit = r.matches.some(m => m.package_id === 'probability_stats_core' && /bayes factor/i.test(m.concept));
+    record('6. bare noun-phrase: "Bayes factor" routes to probability_stats_core',
+      r.query_class === 'definitional' && hit, r);
+  } else {
+    skip('6. Bayes factor bare-NP', 'probability_stats_core not loaded');
+  }
+
+  // 7. Package without covers still works (no errors, no surfacing via covers)
+  (() => {
+    const noCovers = LOADED_PACKAGES.filter(p => !getCoversIndex(p));
+    if (noCovers.length === 0) {
+      skip('7. covers-less packages skipped cleanly', 'no covers-less packages currently loaded');
+      return;
+    }
+    let ok = true;
+    try {
+      coversRoute('what is anything?');
+    } catch (e) {
+      ok = false;
+    }
+    record('7. covers-less packages do not break covers stage', ok,
+      `covers-less packages: ${noCovers.map(p => p.manifest.package_id).join(', ')}`);
+  })();
+
+  // 8. Substring containment is intentional
+  if (have('probability_stats_core')) {
+    const r = coversRoute('what is a confidence interval?');
+    const exact = r.matches.some(m => m.package_id === 'probability_stats_core' && normalizeForCovers(m.concept) === 'confidence interval');
+    const containment = r.matches.some(m => m.package_id === 'probability_stats_core' && /credible interval vs confidence interval/i.test(m.concept));
+    record('8. substring containment: surfaces both exact and "credible interval vs confidence interval"',
+      exact && containment, r);
+  } else {
+    skip('8. confidence interval containment', 'probability_stats_core not loaded');
+  }
+
+  const passed = results.filter(r => r.ok === true).length;
+  const failed = results.filter(r => r.ok === false).length;
+  const skipped = results.filter(r => r.ok === null).length;
+  console.log(`covers tests: ${passed} passed, ${failed} failed, ${skipped} skipped`);
+  return { passed, failed, skipped, results };
+}
+
+window.tcogCoversTests = tcogCoversTests;
+window.coversRoute = coversRoute;
+window.detectQueryClass = detectQueryClass;
+window.extractCoversTarget = extractCoversTarget;
 
 function verdictClassLabel(verdict) {
   return {
@@ -2508,13 +3797,102 @@ function renderFrameRoleSummary(appraisal) {
   `;
 }
 
+function renderClaimInterpretation(claim) {
+  // Only meaningful when the LLM extracted the claim (canonical_claim differs
+  // from the original_text_span, or extraction metadata is present).
+  const meta = claim.extraction_meta;
+  if (!meta) return '';
+  const canonical = claim.canonical_claim || '';
+  const sentence = claim.sentence || '';
+  const sameAsSentence = normalize(canonical) === normalize(sentence);
+  const refs = (meta.resolved_references || []).filter(r => r && r.original);
+  const refsHtml = refs.length
+    ? '<ul class="trace-list">' + refs.map(r => `<li><code>${escapeHtml(r.original)}</code> → ${escapeHtml(r.resolved_as || '')}</li>`).join('') + '</ul>'
+    : '';
+  const summary = sameAsSentence
+    ? `Claim interpreted as: <em>same as written</em>${meta.depends_on_previous ? ' · depends on previous' : ''}`
+    : `Claim interpreted as: ${escapeHtml(canonical)}${meta.depends_on_previous ? ' <span style="color:var(--ink-faint);">(depends on previous)</span>' : ''}`;
+  const noteHtml = meta.confidence_note
+    ? `<div style="margin-top:4px; color:var(--ink-soft);">${escapeHtml(meta.confidence_note)}</div>`
+    : '';
+  const contextHtml = meta.context_needed
+    ? `<div style="margin-top:4px; color:var(--ink-soft);"><strong>Context needed:</strong> ${escapeHtml(meta.context_needed)}</div>`
+    : '';
+  return `
+    <details style="margin-top:6px; font-size:12px; color:var(--ink-soft);">
+      <summary>${summary}</summary>
+      <div style="margin-top:6px;">
+        <div><strong>Canonical claim:</strong></div>
+        <div style="margin-top:2px;">${escapeHtml(canonical)}</div>
+        ${refs.length ? `<div style="margin-top:6px;"><strong>Resolved references:</strong></div>${refsHtml}` : ''}
+        ${contextHtml}
+        ${noteHtml}
+        <div style="margin-top:6px; color:var(--ink-faint);">claim_id: <code>${escapeHtml(meta.claim_id || '')}</code> · type: <code>${escapeHtml(meta.claim_type || '')}</code></div>
+      </div>
+    </details>
+  `;
+}
+
+function renderExtractionMetaCard(appraisal) {
+  if (appraisal.extraction_used !== 'llm') return null;
+  const warnings = appraisal.extraction_warnings || [];
+  const div = document.createElement('div');
+  div.className = 'section section-A';
+  const warningsHtml = warnings.length
+    ? '<details style="margin-top:6px;"><summary>Extraction warnings (' + warnings.length + ')</summary><ul class="trace-list">' + warnings.map(w => `<li>${escapeHtml(w)}</li>`).join('') + '</ul></details>'
+    : '<p style="color:var(--ink-faint); font-size:13px; margin:0;"><em>No extraction warnings.</em></p>';
+  div.innerHTML = `
+    <div class="section-label"><span>LLM-assisted claim extraction</span><span style="color:var(--ink-faint);">${appraisal.claims.length} claim${appraisal.claims.length !== 1 ? 's' : ''} extracted</span></div>
+    <div class="section-content">
+      <p style="font-size:13px; color:var(--ink-soft); margin:0;">Coherent claims were extracted from the original text and references were resolved using only the local text. Mechanical retrieval ran on the canonical claims; click "Claim interpreted as" in any row to see the resolved form.</p>
+      ${warningsHtml}
+    </div>
+  `;
+  return div;
+}
+
+function renderConstraintRelevanceCell(claim) {
+  const cr = claim.constraint_relevance;
+  if (!cr) return '';
+  const fmtIds = items => (items && items.length)
+    ? '<ul class="trace-list">' + items.map(id => `<li><code>${escapeHtml(id)}</code></li>`).join('') + '</ul>'
+    : '<p style="color:var(--ink-faint); font-size:12px; margin:0;"><em>none</em></p>';
+  const fmtObjs = items => (items && items.length)
+    ? '<ul class="trace-list">' + items.map(e => `<li><code>${escapeHtml(e.constraint_id)}</code>${e.reason ? ` — ${escapeHtml(e.reason)}` : ''}</li>`).join('') + '</ul>'
+    : '<p style="color:var(--ink-faint); font-size:12px; margin:0;"><em>none</em></p>';
+  const warningsHtml = (cr.validation_warnings && cr.validation_warnings.length)
+    ? `<div style="margin-top:6px;"><strong>Validation warnings:</strong></div><ul class="trace-list">${cr.validation_warnings.map(w => `<li>${escapeHtml(w)}</li>`).join('')}</ul>`
+    : '';
+  const mechanicalHtml = (claim.mechanical_triggered_constraints && claim.mechanical_triggered_constraints.length)
+    ? `<div style="margin-top:6px; font-size:12px; color:var(--ink-soft);"><strong>Original mechanical triggers:</strong> ${escapeHtml(diagnosticValue(claim.mechanical_triggered_constraints))}</div>`
+    : '';
+  const rationale = cr.relevance_rationale
+    ? `<p style="margin:4px 0 0; font-size:12px; color:var(--ink-soft);">${escapeHtml(cr.relevance_rationale)}</p>`
+    : '';
+  return `
+    <div class="constraint-relevance" style="font-size:12px; margin-top:8px; padding-top:8px; border-top:1px dotted var(--rule);">
+      <div><strong>Governing constraints</strong></div>
+      ${fmtIds(cr.governing_constraints)}
+      <div style="margin-top:6px;"><strong>Relevant auxiliary constraints</strong></div>
+      ${fmtObjs(cr.relevant_auxiliary_constraints)}
+      <details style="margin-top:6px;">
+        <summary>Ignored lexical matches: these packages matched surface terms but were not treated as relevant constraints for this claim.</summary>
+        ${fmtObjs(cr.ignored_lexical_constraints)}
+        ${warningsHtml}
+        ${mechanicalHtml}
+      </details>
+      ${rationale}
+    </div>
+  `;
+}
+
 function renderSolidityAppraisal(appraisal, repairedText = null) {
   const div = document.createElement('div');
   div.className = 'section section-compare';
   const rows = appraisal.claims.length
     ? appraisal.claims.map(c => `
       <tr>
-        <td>${escapeHtml(c.sentence)}</td>
+        <td>${escapeHtml(c.sentence)}${renderClaimInterpretation(c)}</td>
         <td>${escapeHtml(frameLabel(c.primary_frame))}</td>
         <td>${escapeHtml(diagnosticValue(c.active_packages))}</td>
         <td>${escapeHtml(diagnosticValue(c.active_clusters.map(shortClusterId)))}</td>
@@ -2526,6 +3904,7 @@ function renderSolidityAppraisal(appraisal, repairedText = null) {
           <div style="font-size:12px; color:var(--ink-soft); margin-top:4px;">Support verdict: <code>${escapeHtml(c.display_status?.support_verdict || 'unknown')}</code></div>
           <div style="font-size:12px; color:var(--ink-soft); margin-top:4px;">Frame fit: <code>${escapeHtml(c.display_status?.frame_fit || frameFitStatusLabel(c.frame_fit?.frame_fit_status))}</code>${c.frame_fit?.reason ? ` — ${escapeHtml(c.frame_fit.reason)}` : ''}</div>
           <div style="font-size:12px; color:var(--ink-soft); margin-top:4px;">Caveat status: <code>${escapeHtml(c.display_status?.caveat_status || 'unknown')}</code></div>
+          ${renderConstraintRelevanceCell(c)}
           ${renderVerdictDebug(c.verdict_debug)}
         </td>
         <td>${escapeHtml(c.suggested_repair)}</td>
@@ -2631,17 +4010,31 @@ Draft a repaired version now.`
 function buildSoliditySummaryPrompt(text, appraisalResult) {
   const claimRows = appraisalResult.claims.map((c, idx) => {
     const unitIds = c.units.map(u => u.id).join(', ') || 'none';
-    return `${idx + 1}. Claim: ${c.sentence}
-Verdict: ${c.verdict}
-Primary frame: ${frameLabel(c.primary_frame)}
-Auxiliary frames: ${frameListLabel(c.auxiliary_frames)}
-Constraint frames: ${frameListLabel(c.constraint_frames)}
-Suppressed frames: ${frameListLabel(c.suppressed_frames)}
-Active packages: ${diagnosticValue(c.active_packages)}
-Active clusters: ${diagnosticValue(c.active_clusters)}
-Triggered constraints: ${diagnosticValue(c.triggered_constraints)}
-Unit ids: ${unitIds}
-Suggested repair: ${c.suggested_repair}`;
+    const cr = c.constraint_relevance;
+    const governingLine = cr
+      ? `Governing constraints: ${diagnosticValue(cr.governing_constraints)}`
+      : `Triggered constraints: ${diagnosticValue(c.triggered_constraints)}`;
+    const relevantLine = cr
+      ? `Relevant auxiliary constraints: ${diagnosticValue((cr.relevant_auxiliary_constraints || []).map(e => e.constraint_id))}`
+      : '';
+    const ignoredLine = cr
+      ? `Ignored lexical matches (DO NOT use as reasons for the verdict): ${diagnosticValue((cr.ignored_lexical_constraints || []).map(e => e.constraint_id))}`
+      : '';
+    return [
+      `${idx + 1}. Claim: ${c.sentence}`,
+      `Verdict: ${c.verdict}`,
+      `Primary frame: ${frameLabel(c.primary_frame)}`,
+      `Auxiliary frames: ${frameListLabel(c.auxiliary_frames)}`,
+      `Constraint frames: ${frameListLabel(c.constraint_frames)}`,
+      `Suppressed frames: ${frameListLabel(c.suppressed_frames)}`,
+      `Active packages: ${diagnosticValue(c.active_packages)}`,
+      `Active clusters: ${diagnosticValue(c.active_clusters)}`,
+      governingLine,
+      relevantLine,
+      ignoredLine,
+      `Unit ids: ${unitIds}`,
+      `Suggested repair: ${c.suggested_repair}`
+    ].filter(Boolean).join('\n');
   }).join('\n\n') || '(no claim-like sentences)';
 
   const unsupported = appraisalResult.claims
@@ -2659,7 +4052,7 @@ Suggested repair: ${c.suggested_repair}`;
     .join('\n') || '(none)';
 
   return {
-    systemPrompt: 'You are the prose-summary layer for TCog-R Claim Solidity Appraisal. The appraisal has already been computed mechanically. Do not perform new retrieval, do not add external knowledge, and do not change the verdict. Summarize the findings clearly for a human reader.',
+    systemPrompt: 'You are the prose-summary layer for TCog-R Claim Solidity Appraisal. The appraisal has already been computed mechanically; the LLM relevance filter (when present) has already classified constraints into governing, relevant_auxiliary, and ignored_lexical categories. Do not perform new retrieval, do not add external knowledge, and do not change the verdict. Summarize the findings clearly for a human reader. Ignored lexical constraints are not substantive cross-frame conflicts. Do not use them as reasons for the main verdict; you may mention them only under a brief "Ignored lexical matches, not used for verdict." aside.',
     userPrompt: `Original text:
 ${text}
 
@@ -2706,6 +4099,247 @@ async function summarizeSolidityWithProvider(appraisalResult) {
   );
 }
 
+// ============================================================================
+// Constraint relevance filter (LLM)
+// ============================================================================
+// Mechanical retrieval is broad; many constraints can fire from non-primary
+// frames because terms are overloaded across domains. The relevance filter
+// asks the LLM to classify each mechanically triggered constraint as
+// governing / relevant_auxiliary / ignored_lexical so the verdict reflects
+// substantive relevance instead of surface-term collisions. Mechanical
+// validation remains authoritative — sticky safety constraints and primary-
+// frame constraints cannot be silently removed by the LLM.
+// ============================================================================
+
+const SAFETY_PACKAGE_HINTS = [
+  'medicine', 'medical', 'counsel', 'safety', 'crisis', 'emergency', 'red_flag', 'law'
+];
+
+// Sticky: critical/high blocking constraints from safety-like packages must
+// remain visible regardless of LLM classification.
+function isStickySafetyConstraint(constraintHit) {
+  if (!constraintHit || !constraintHit.constraint) return false;
+  const c = constraintHit.constraint;
+  if (!c.blocks_answer) return false;
+  const sev = String(c.severity || '').toLowerCase();
+  if (sev !== 'critical' && sev !== 'high') return false;
+  const pkgId = String(constraintHit.package_id || '').toLowerCase();
+  const cId = String(c.id || '').toLowerCase();
+  if (SAFETY_PACKAGE_HINTS.some(h => pkgId.includes(h))) return true;
+  return /\b(safety|red_flag|crisis)\b/.test(cId);
+}
+
+function buildConstraintRelevancePrompt(sentence, sentenceAppraisal) {
+  const trace = sentenceAppraisal.trace || {};
+  const primary = sentenceAppraisal.primary_frame;
+  const primaryId = primary ? primary.package_id : null;
+  const constraintsBlock = (trace.triggered_constraints || []).map(t => {
+    const c = t.constraint;
+    return `- ${c.id} [pkg ${t.package_id}] severity=${c.severity || '—'} blocks_answer=${!!c.blocks_answer} | rule: ${c.rule || ''} | repair: ${c.repair || ''}`;
+  }).join('\n') || '(none)';
+  const pkgsBlock = (trace.active_packages || [])
+    .map(p => `- ${p.manifest.package_id} (${p.manifest.domain || '—'})${primaryId === p.manifest.package_id ? ' [PRIMARY]' : ''}`)
+    .join('\n') || '(none)';
+  const clustersBlock = (trace.activated_clusters || [])
+    .map(a => `- ${a.cluster.id} [pkg ${a.package_id}] cues: ${(a.positive_matches || []).join(', ') || '—'}`)
+    .join('\n') || '(none)';
+  const primaryUnits = (trace.units || [])
+    .filter(u => primaryId && unitPackageId(u) === primaryId)
+    .map(u => `- [${u.id}] ${u.label || ''}: ${u.definition || ''}`)
+    .join('\n') || '(no primary-frame units retrieved)';
+
+  const systemPrompt = `You are the constraint relevance-filtering layer for TCog-R Claim Solidity Appraisal. Mechanical retrieval is broad and may over-trigger constraints from non-primary packages because terms are overloaded across domains. Your job is to classify which mechanically triggered constraints are substantively relevant to the sentence and which matched only on overloaded surface terms. Do NOT use external knowledge. Do NOT invent constraint ids. Do NOT change the primary frame. Do NOT answer the user's claim. Return JSON only.`;
+
+  const userPrompt = `Sentence:
+${sentence}
+
+Primary frame: ${primaryId || '(none)'}
+
+Active packages:
+${pkgsBlock}
+
+Active clusters and cue matches:
+${clustersBlock}
+
+Primary-frame supporting units (if any):
+${primaryUnits}
+
+Mechanically triggered constraints (the only ids you may classify):
+${constraintsBlock}
+
+Rules:
+- Classify only constraints listed above. Do NOT invent ids.
+- Each constraint id must appear in exactly one category.
+- Primary-frame constraints typically belong in governing_constraints.
+- Non-primary constraints belong in relevant_auxiliary_constraints only when the sentence substantively invokes that domain frame.
+- If a non-primary constraint matched only because of overloaded generic terms (e.g. "decision rule", "function", "evidence", "design", "model", "stability"), classify it as ignored_lexical_constraints with a brief reason.
+- Do not treat ignored lexical constraints as cross-frame conflicts.
+- Critical or high blocks_answer constraints from safety-like packages should not be ignored; the validator will keep them sticky.
+
+Return ONLY a JSON object with this exact shape:
+
+{
+  "governing_constraints": [],
+  "relevant_auxiliary_constraints": [
+    {"constraint_id": "", "reason": ""}
+  ],
+  "ignored_lexical_constraints": [
+    {"constraint_id": "", "reason": ""}
+  ],
+  "relevance_rationale": ""
+}
+
+governing_constraints is an array of constraint id strings.
+The other two lists are arrays of {constraint_id, reason} objects.`;
+  return { systemPrompt, userPrompt };
+}
+
+function validateConstraintRelevanceFilter(filterResult, sentenceAppraisal) {
+  const warnings = [];
+  const triggered = (sentenceAppraisal.trace && sentenceAppraisal.trace.triggered_constraints) || [];
+  const constraintIndex = new Map(triggered.map(t => [t.constraint.id, t]));
+  const primaryPkgId = sentenceAppraisal.primary_frame ? sentenceAppraisal.primary_frame.package_id : null;
+  const seen = new Set();
+
+  const filterIdList = (items, label) => {
+    const kept = [];
+    for (const id of items || []) {
+      if (typeof id !== 'string') { warnings.push(`${label}: dropped non-string entry`); continue; }
+      if (!constraintIndex.has(id)) { warnings.push(`${label}: unknown constraint id "${id}" — dropped`); continue; }
+      if (seen.has(id)) { warnings.push(`${label}: "${id}" already classified — dropped from this category`); continue; }
+      seen.add(id);
+      kept.push(id);
+    }
+    return kept;
+  };
+  const filterObjList = (items, label) => {
+    const kept = [];
+    for (const obj of items || []) {
+      if (!obj || typeof obj !== 'object') continue;
+      const id = obj.constraint_id;
+      if (typeof id !== 'string') { warnings.push(`${label}: dropped entry without constraint_id`); continue; }
+      if (!constraintIndex.has(id)) { warnings.push(`${label}: unknown constraint id "${id}" — dropped`); continue; }
+      if (seen.has(id)) { warnings.push(`${label}: "${id}" already classified — dropped from this category`); continue; }
+      seen.add(id);
+      kept.push({ constraint_id: id, reason: typeof obj.reason === 'string' ? obj.reason : '' });
+    }
+    return kept;
+  };
+
+  const governing_constraints = filterIdList(filterResult.governing_constraints, 'governing_constraints');
+  const relevant_auxiliary_constraints = filterObjList(filterResult.relevant_auxiliary_constraints, 'relevant_auxiliary_constraints');
+  let ignored_lexical_constraints = filterObjList(filterResult.ignored_lexical_constraints, 'ignored_lexical_constraints');
+
+  // Sticky safety override: critical/high blocking safety constraints cannot be ignored.
+  const stickyMoved = [];
+  ignored_lexical_constraints = ignored_lexical_constraints.filter(entry => {
+    if (isStickySafetyConstraint(constraintIndex.get(entry.constraint_id))) {
+      stickyMoved.push(entry.constraint_id);
+      return false;
+    }
+    return true;
+  });
+  for (const id of stickyMoved) {
+    if (!governing_constraints.includes(id)) governing_constraints.push(id);
+    warnings.push(`safety_override: "${id}" is a critical/high blocking safety constraint — kept as governing`);
+  }
+
+  // Primary-frame override: primary-frame constraints cannot be silently ignored.
+  const primaryMoved = [];
+  ignored_lexical_constraints = ignored_lexical_constraints.filter(entry => {
+    const hit = constraintIndex.get(entry.constraint_id);
+    if (primaryPkgId && hit && hit.package_id === primaryPkgId) {
+      primaryMoved.push(entry.constraint_id);
+      return false;
+    }
+    return true;
+  });
+  for (const id of primaryMoved) {
+    if (!governing_constraints.includes(id)) governing_constraints.push(id);
+    warnings.push(`primary_frame_override: "${id}" is a primary-frame constraint and cannot be ignored — kept as governing`);
+  }
+
+  // Conservative default: any triggered constraint NOT classified should not be silently dropped.
+  for (const t of triggered) {
+    const id = t.constraint.id;
+    if (seen.has(id)) continue;
+    seen.add(id);
+    if (isStickySafetyConstraint(t) || (primaryPkgId && t.package_id === primaryPkgId)) {
+      governing_constraints.push(id);
+      warnings.push(`unclassified: "${id}" not in LLM output — added to governing`);
+    } else {
+      relevant_auxiliary_constraints.push({ constraint_id: id, reason: '(LLM did not classify; mechanically triggered)' });
+      warnings.push(`unclassified: "${id}" not in LLM output — added to relevant_auxiliary as a conservative default`);
+    }
+  }
+
+  return {
+    governing_constraints,
+    relevant_auxiliary_constraints,
+    ignored_lexical_constraints,
+    relevance_rationale: typeof filterResult.relevance_rationale === 'string' ? filterResult.relevance_rationale : '',
+    validation_warnings: warnings
+  };
+}
+
+// Re-derive verdict and display_status from the filtered constraint set,
+// preserving the original mechanical fields under mechanical_*.
+function applyConstraintRelevanceToClaim(claim, validatedFilter) {
+  const ignoredIds = new Set((validatedFilter.ignored_lexical_constraints || []).map(e => e.constraint_id));
+  const filteredTrace = Object.assign({}, claim.trace, {
+    triggered_constraints: (claim.trace.triggered_constraints || []).filter(t => !ignoredIds.has(t.constraint.id))
+  });
+  const detailed = classifyClaimSentenceDetailed(claim.sentence, filteredTrace);
+  const verdict = detailed.verdict;
+  const display_status = claimDisplayStatus(verdict, filteredTrace, detailed.verdict_debug);
+
+  // Preserve mechanical originals for transparency.
+  claim.mechanical_verdict = claim.verdict;
+  claim.mechanical_display_status = claim.display_status;
+  claim.mechanical_triggered_constraints = claim.triggered_constraints.slice();
+  claim.mechanical_verdict_debug = claim.verdict_debug;
+  claim.mechanical_frame_fit = claim.frame_fit;
+  claim.mechanical_suggested_repair = claim.suggested_repair;
+
+  claim.constraint_relevance = validatedFilter;
+  claim.verdict = verdict;
+  claim.verdict_debug = detailed.verdict_debug;
+  claim.display_status = display_status;
+  claim.frame_fit = detailed.verdict_debug.frame_fit;
+  claim.triggered_constraints = filteredTrace.triggered_constraints.map(t => t.constraint.id);
+  claim.suggested_repair = suggestedClaimRepair(verdict, filteredTrace);
+  return claim;
+}
+
+async function runConstraintRelevanceFiltersOnAppraisal(appraisal, providerConfig) {
+  const errors = [];
+  await Promise.all((appraisal.claims || []).map(async claim => {
+    if (!claim.trace || (claim.trace.triggered_constraints || []).length === 0) return;
+    try {
+      const prompt = buildConstraintRelevancePrompt(claim.sentence, claim);
+      const text = await generatePromptWithProvider(
+        providerConfig.provider,
+        prompt.systemPrompt,
+        prompt.userPrompt,
+        providerConfig.apiKey,
+        providerConfig.model
+      );
+      const raw = parseLLMJsonStrict(text);
+      const validated = validateConstraintRelevanceFilter(raw, claim);
+      applyConstraintRelevanceToClaim(claim, validated);
+    } catch (e) {
+      errors.push({ sentence: claim.sentence, error: e.message });
+    }
+  }));
+
+  // Rebuild the appraisal-level summary record from the (now possibly mutated) claims.
+  const refreshed = buildSolidityAppraisalRecord(appraisal.input, appraisal.claims);
+  Object.assign(appraisal, refreshed);
+  appraisal.has_constraint_relevance_filter = true;
+  appraisal.constraint_relevance_errors = errors;
+  return appraisal;
+}
+
 function renderSoliditySummaryCard(summaryText) {
   const div = document.createElement('div');
   div.className = 'section section-D';
@@ -2728,9 +4362,14 @@ function renderSoliditySummaryCard(summaryText) {
 // UNIT_MAP is rebuilt whenever packages change. Citations look up here.
 const UNIT_MAP = {};
 let LAST_RETRIEVAL = null;
+// Module state used by the user-override click handler so it can recompose
+// without re-running the full pipeline.
+let LAST_LLM_GUIDED_RESULT = null;
+let LAST_LLM_GUIDED_PROVIDER = null;
 let LAST_APPRAISAL = null;
 let LAST_SOLIDITY_SUMMARY = null;
 let LAST_SOLIDITY_NOTICE = null;
+let LAST_SOLIDITY_SUMMARY_WARNINGS = [];
 
 function rebuildUnitMap() {
   // Clear and repopulate from all loaded packages
@@ -3207,9 +4846,43 @@ function renderProtocolTraceDetails(sections) {
   return details;
 }
 
+// Renders a "Covers matches" card from a trace.covers_routing or from a list
+// of covers_matches objects. Surfaces package, concept, scope, and role.
+// Returns null when there is nothing to show (covers stage not run, or no
+// matches) so callers can append conditionally.
+function renderCoversCard(coversRouting, opts) {
+  if (!coversRouting) return null;
+  const matches = coversRouting.matches || coversRouting.covers_matches || [];
+  const target = coversRouting.target || coversRouting.covers_target || '';
+  const queryClass = coversRouting.query_class || coversRouting.covers_query_class || '';
+  // Don't render when covers wasn't applicable.
+  if (!queryClass || (queryClass !== 'definitional' && queryClass !== 'procedural')) return null;
+  if (matches.length === 0 && !(opts && opts.alwaysShow)) return null;
+  const div = document.createElement('div');
+  div.className = 'section section-A';
+  const header = matches.length
+    ? `Matched via covers (${escapeHtml(queryClass)}, target "${escapeHtml(target)}"): ${matches.length} package${matches.length !== 1 ? 's' : ''}`
+    : `Covers pre-pass ran (${escapeHtml(queryClass)}, target "${escapeHtml(target)}") but found no matches; falling through to broad retrieval.`;
+  const list = matches.length
+    ? '<ul class="trace-list">' + matches.map(m =>
+        `<li><code>${escapeHtml(m.package_id)}</code> → "${escapeHtml(m.concept)}"${m.scope ? ` <span style="color:var(--ink-faint);">(${escapeHtml(m.scope)})</span>` : ''} <span class="status-pill" style="background:rgba(45,74,62,0.10); color:var(--accent-2);">${escapeHtml(m.role)}</span></li>`
+      ).join('') + '</ul>'
+    : '';
+  div.innerHTML = `
+    <div class="section-label"><span>Covers-routed pre-pass</span><span style="color:var(--ink-faint);">TCog Protocol v0.3.1 §4.4</span></div>
+    <div class="section-content">
+      <p style="margin:0 0 8px;">${header}</p>
+      ${list}
+    </div>
+  `;
+  return div;
+}
+
 function renderRawResponse(trace, sections, query = '') {
   const out = document.getElementById('output');
   out.innerHTML = '';
+  const coversCard = renderCoversCard(trace.covers_routing);
+  if (coversCard) out.appendChild(coversCard);
   const summary = renderAnswerSummaryCard(query, trace, sections);
   out.appendChild(renderFrameRolesCard(trace));
   out.appendChild(summary.div);
@@ -3302,39 +4975,50 @@ async function runQuery() {
   resetPipeline();
   const out = document.getElementById('output');
 
-  // Step 1: mechanical retrieval (always, regardless of mode)
-  const trace = retrieve(query);
-  LAST_RETRIEVAL = { query, trace };
-  updatePipeline(trace);
-  renderTrace(trace);
-
-  const sections = buildRawResponse(query, trace);
-
-  if (mode === 'semantic_augmented' && providerConfig.apiKey) {
-    out.innerHTML = `<div class="empty-state"><div class="marks">...</div><div class="loading-dots">Composing with ${providerConfig.label}</div></div>`;
-    try {
-      const composedText = await composeWithProvider(
-        providerConfig.provider,
-        query,
-        trace,
-        sections,
-        providerConfig.apiKey,
-        providerConfig.model
-      );
-      renderComposedResponse(trace, sections, composedText, query);
-    } catch (e) {
-      const errorHtml = `<div class="section section-G">
-        <div class="section-label"><span><span class="marker">!</span>API error</span></div>
-        <div class="section-content"><p>${escapeHtml(e.message)}</p>
-        <p style="font-size: 13px; color: var(--ink-soft); margin-top: 12px;">Falling back to raw retrieval output:</p>
-        </div>
-      </div>`;
-      renderRawResponse(trace, sections, query);
-      out.insertAdjacentHTML('afterbegin', errorHtml);
-    }
-  } else {
+  // Mechanical only: existing deterministic baseline (unchanged).
+  if (mode !== 'llm_guided') {
+    const trace = retrieve(query);
+    LAST_RETRIEVAL = { query, trace };
+    updatePipeline(trace);
+    renderTrace(trace);
+    const sections = buildRawResponse(query, trace);
     renderRawResponse(trace, sections, query);
+    return;
   }
+
+  // LLM-guided TCog-R: query understanding → broad candidate retrieval →
+  // LLM candidate selection → mechanical validation → constraint gate →
+  // selection-grounded composition. TCog-R packages and constraint gates
+  // remain authoritative throughout.
+  if (!providerConfig.apiKey) {
+    const trace = retrieve(query);
+    LAST_RETRIEVAL = { query, trace };
+    updatePipeline(trace);
+    renderTrace(trace);
+    const sections = buildRawResponse(query, trace);
+    out.innerHTML = '';
+    out.appendChild(renderSmallErrorCard(
+      'LLM-guided TCog-R unavailable',
+      `Add a ${providerConfig.label} API key to use the LLM-guided pipeline. Showing Mechanical only output instead.`
+    ));
+    const summary = renderAnswerSummaryCard(query, trace, sections);
+    out.appendChild(renderFrameRolesCard(trace));
+    out.appendChild(summary.div);
+    out.appendChild(renderPackageBoundCard(sections));
+    out.appendChild(renderConstraintsCard(sections));
+    out.appendChild(renderNextMoveCard(summary.next));
+    out.appendChild(renderProtocolTraceDetails(sections));
+    return;
+  }
+
+  out.innerHTML = `<div class="empty-state"><div class="marks">...</div><div class="loading-dots">Running LLM-guided TCog-R with ${providerConfig.label}</div></div>`;
+  const result = await runLLMGuidedTCogR(query, providerConfig);
+  if (result.mechanicalTrace) {
+    LAST_RETRIEVAL = { query, trace: result.mechanicalTrace };
+    updatePipeline(result.mechanicalTrace);
+    renderTrace(result.mechanicalTrace);
+  }
+  renderLLMGuidedResult(result);
 }
 
 async function runAnswerComparison() {
@@ -3350,40 +5034,42 @@ async function runAnswerComparison() {
   }
 
   resetPipeline();
-  out.innerHTML = `<div class="empty-state"><div class="marks">...</div><div class="loading-dots">Generating vanilla LLM answer and TCog-R answer</div></div>`;
+  out.innerHTML = `<div class="empty-state"><div class="marks">...</div><div class="loading-dots">Generating vanilla LLM answer and LLM-guided TCog-R answer</div></div>`;
 
-  const trace = retrieve(query);
-  LAST_RETRIEVAL = { query, trace };
-  updatePipeline(trace);
-  renderTrace(trace);
-  const sections = buildRawResponse(query, trace);
-
-  const [normalSettled, tcogSettled] = await Promise.allSettled([
+  // The TCog-R side now runs the LLM-guided TCog-R pipeline. The vanilla side
+  // remains a raw query → LLM answer with no retrieval guidance.
+  const [normalSettled, guidedResult] = await Promise.all([
     normalWithProvider(
       providerConfig.provider,
       query,
       providerConfig.apiKey,
       providerConfig.model
-    ),
-    composeWithProvider(
-      providerConfig.provider,
-      query,
-      trace,
-      sections,
-      providerConfig.apiKey,
-      providerConfig.model
-    )
+    ).then(text => ({ status: 'fulfilled', value: text }), reason => ({ status: 'rejected', reason })),
+    runLLMGuidedTCogR(query, providerConfig)
   ]);
+
+  const trace = guidedResult.mechanicalTrace || retrieve(query);
+  const sections = guidedResult.mechanicalSections || buildRawResponse(query, trace);
+  LAST_RETRIEVAL = { query, trace };
+  updatePipeline(trace);
+  renderTrace(trace);
 
   const normalResult = normalSettled.status === 'fulfilled'
     ? { ok: true, text: normalSettled.value }
     : { ok: false, error: `Vanilla LLM generation failed: ${normalSettled.reason?.message || normalSettled.reason}` };
 
-  const tcogResult = tcogSettled.status === 'fulfilled'
-    ? { ok: true, text: tcogSettled.value }
-    : { ok: false, error: `TCog-R composition failed; showing raw retrieval output below. ${tcogSettled.reason?.message || tcogSettled.reason}` };
+  let tcogResult;
+  if (guidedResult.answerText) {
+    tcogResult = { ok: true, text: guidedResult.answerText };
+  } else {
+    const errMsg = (guidedResult.errors || []).join(' | ') || 'LLM-guided TCog-R produced no answer.';
+    tcogResult = { ok: false, error: `TCog-R composition failed; showing raw retrieval output below. ${errMsg}` };
+  }
 
+  // Audit the vanilla answer against the same mechanical trace used by the
+  // candidate payload so the audit reflects the actual retrieval state.
   const normalAudit = normalResult.ok ? auditDraftAnswer(query, normalResult.text, trace) : null;
+
   let repairedResult;
   try {
     const repairPrompt = buildComparisonRepairPrompt(query, normalResult.text || '', trace, normalAudit);
@@ -3409,6 +5095,18 @@ async function runAnswerComparison() {
     normalAudit,
     repairedResult
   }));
+
+  // Surface the LLM-guided pipeline trace below the comparison card so the
+  // vanilla answer can be checked against the actual selection / gate result.
+  if (guidedResult.candidatePayload) {
+    if (guidedResult.validatedSelection) {
+      out.appendChild(renderSelectionCard(guidedResult.validatedSelection, guidedResult.candidatePayload));
+    }
+    if (guidedResult.gatedResult) {
+      out.appendChild(renderConstraintGateCard(guidedResult.gatedResult, guidedResult.candidatePayload));
+    }
+    out.appendChild(renderCandidateTraceDetails(guidedResult.candidatePayload, guidedResult.mechanicalSections));
+  }
 }
 
 function runFlatBaseline() {
@@ -3473,6 +5171,11 @@ function renderCurrentSolidityOutput(repairedText = null) {
   const out = document.getElementById('output');
   out.innerHTML = '';
   if (LAST_SOLIDITY_NOTICE) out.appendChild(renderSmallErrorCard(LAST_SOLIDITY_NOTICE.title, LAST_SOLIDITY_NOTICE.message));
+  const extractionCard = LAST_APPRAISAL ? renderExtractionMetaCard(LAST_APPRAISAL) : null;
+  if (extractionCard) out.appendChild(extractionCard);
+  if (LAST_SOLIDITY_SUMMARY_WARNINGS && LAST_SOLIDITY_SUMMARY_WARNINGS.length) {
+    out.appendChild(renderSummaryConsistencyWarningsCard(LAST_SOLIDITY_SUMMARY_WARNINGS));
+  }
   if (LAST_SOLIDITY_SUMMARY) out.appendChild(renderSoliditySummaryCard(LAST_SOLIDITY_SUMMARY));
   out.appendChild(renderClaimAppraisal(LAST_APPRAISAL, repairedText));
 }
@@ -3481,12 +5184,92 @@ async function runClaimAppraisal() {
   const text = document.getElementById('appraise-text').value.trim();
   if (!text) return;
   resetPipeline();
-  const appraisal = appraiseClaimSolidity(text);
+
+  const providerConfig = getSelectedProviderConfig();
+  const wantExtraction = document.getElementById('solidity-llm-claim-extraction')?.checked;
+
+  // Step 1: build the appraisal. LLM-assisted extraction when available;
+  // mechanical sentence splitting as fallback / audit baseline.
+  let appraisal;
+  let extractionNotice = null;
+  if (wantExtraction && providerConfig.apiKey) {
+    const out = document.getElementById('output');
+    out.innerHTML = `<div class="empty-state"><div class="marks">...</div><div class="loading-dots">Extracting coherent claims with ${escapeHtml(providerConfig.label)}</div></div>`;
+    try {
+      const extraction = await runLLMClaimExtraction(text, providerConfig);
+      if (!extraction.ok || extraction.claims.length === 0) {
+        extractionNotice = {
+          title: 'LLM claim extraction unavailable',
+          message: 'No claims were extracted. Falling back to mechanical sentence splitting. ' + (extraction.warnings || []).join(' | ')
+        };
+        appraisal = appraiseClaimSolidity(text);
+      } else {
+        const claims = extraction.claims.map(appraiseExtractedClaim);
+        appraisal = buildSolidityAppraisalRecord(text, claims);
+        appraisal.extraction_used = 'llm';
+        appraisal.extraction_warnings = extraction.warnings || [];
+      }
+    } catch (e) {
+      extractionNotice = {
+        title: 'LLM claim extraction unavailable',
+        message: `Falling back to mechanical sentence splitting. ${e.message}`
+      };
+      appraisal = appraiseClaimSolidity(text);
+    }
+  } else {
+    appraisal = appraiseClaimSolidity(text);
+    if (wantExtraction && !providerConfig.apiKey) {
+      extractionNotice = {
+        title: 'Mechanical sentence splitting in use',
+        message: 'Mechanical sentence splitting is being used. Add a provider key to use LLM-assisted claim extraction.'
+      };
+    }
+  }
+
   LAST_APPRAISAL = appraisal;
   LAST_SOLIDITY_SUMMARY = null;
-  LAST_SOLIDITY_NOTICE = null;
+  LAST_SOLIDITY_SUMMARY_WARNINGS = [];
+  LAST_SOLIDITY_NOTICE = extractionNotice;
   renderCurrentSolidityOutput();
   updateRepairedDraftButton();
+
+  // Optional LLM relevance filter for non-primary constraints. Mechanical
+  // appraisal stays authoritative; the filter only re-classifies which of
+  // the already-triggered constraints govern the verdict and which were
+  // overloaded surface-term matches.
+  const filterEnabled = document.getElementById('solidity-llm-relevance-filter')?.checked;
+  if (filterEnabled) {
+    if (!providerConfig.apiKey) {
+      LAST_SOLIDITY_NOTICE = {
+        title: 'LLM relevance filter unavailable',
+        message: 'Mechanical appraisal completed. Add a provider key to filter non-primary constraints with LLM relevance arbitration.'
+      };
+      renderCurrentSolidityOutput();
+    } else {
+      const out = document.getElementById('output');
+      const banner = document.createElement('div');
+      banner.id = 'relevance-filter-loading';
+      banner.className = 'empty-state';
+      banner.innerHTML = `<div class="marks">...</div><div class="loading-dots">Filtering non-primary constraints with ${escapeHtml(providerConfig.label)}</div>`;
+      out.insertBefore(banner, out.firstChild);
+      try {
+        await runConstraintRelevanceFiltersOnAppraisal(appraisal, providerConfig);
+        if (appraisal.constraint_relevance_errors && appraisal.constraint_relevance_errors.length) {
+          LAST_SOLIDITY_NOTICE = {
+            title: 'LLM relevance filter — partial',
+            message: `Some claims could not be filtered: ${appraisal.constraint_relevance_errors.map(e => e.error).join(' | ')}`
+          };
+        } else {
+          LAST_SOLIDITY_NOTICE = null;
+        }
+      } catch (e) {
+        LAST_SOLIDITY_NOTICE = { title: 'LLM relevance filter unavailable', message: e.message };
+      }
+      const stillThere = document.getElementById('relevance-filter-loading');
+      if (stillThere) stillThere.remove();
+      renderCurrentSolidityOutput();
+    }
+  }
 
   if (document.getElementById('solidity-llm-summary').checked) {
     await summarizeCurrentAppraisal();
@@ -3541,6 +5324,51 @@ function showSoliditySummaryAboveAppraisal(summaryText) {
   out.insertBefore(renderSoliditySummaryCard(summaryText), out.firstChild);
 }
 
+// Consistency check: scan the readable summary against the structured
+// appraisal and flag obvious contradictions (claiming "unsupported" when
+// the structured verdict is supported, or treating ignored lexical
+// constraints as cross-frame tensions). Returns a list of warning strings.
+function summaryConsistencyWarnings(summaryText, appraisal) {
+  const warnings = [];
+  if (!summaryText || !appraisal) return warnings;
+  const lower = String(summaryText).toLowerCase();
+  const claims = appraisal.claims || [];
+
+  // 1. "unsupported" / "no support" rhetoric vs. structured verdicts
+  const hasUnsupportedVerdict = claims.some(c => {
+    const sv = c.display_status?.support_verdict;
+    return sv === 'Unsupported' || c.verdict === 'UNSUPPORTED';
+  });
+  const allClaimsHaveSupport = claims.length > 0 && claims.every(c => {
+    const sv = c.display_status?.support_verdict;
+    return sv === 'Package-supported' || sv === 'Weakly supported' || sv === 'Coverage gap';
+  });
+  if (allClaimsHaveSupport && !hasUnsupportedVerdict && /\bunsupported\b|\bno (?:package )?support\b/.test(lower)) {
+    warnings.push('Summary mentions "unsupported"/"no support" but the structured verdict is not unsupported for any claim.');
+  }
+
+  // 2. Treating ignored lexical constraints as cross-frame tensions
+  const ignoredIds = new Set();
+  for (const c of claims) {
+    for (const e of (c.constraint_relevance && c.constraint_relevance.ignored_lexical_constraints) || []) {
+      if (e && e.constraint_id) ignoredIds.add(e.constraint_id);
+    }
+  }
+  for (const id of ignoredIds) {
+    if (lower.includes(id.toLowerCase())) {
+      const idx = lower.indexOf(id.toLowerCase());
+      const window = lower.slice(Math.max(0, idx - 80), Math.min(lower.length, idx + 80));
+      // Treat it as a problem only if the surrounding text reads like a tension/conflict claim.
+      if (/\b(conflict|tension|cross-frame|incompat|requires|must address|undermines?|fails to)\b/.test(window) &&
+          !/\bignored lexical\b/.test(window) &&
+          !/\bnot used for verdict\b/.test(window)) {
+        warnings.push(`Summary appears to treat "${id}" as a substantive tension, but it was classified as an ignored lexical match.`);
+      }
+    }
+  }
+  return warnings;
+}
+
 async function summarizeCurrentAppraisal() {
   if (!LAST_APPRAISAL) return;
   const out = document.getElementById('output');
@@ -3551,16 +5379,56 @@ async function summarizeCurrentAppraisal() {
   }
   out.insertAdjacentHTML('beforeend', `<div class="empty-state" id="summary-loading"><div class="marks">...</div><div class="loading-dots">Writing readable summary</div></div>`);
   try {
-    LAST_SOLIDITY_SUMMARY = await summarizeSolidityWithProvider(LAST_APPRAISAL);
+    let summary = await summarizeSolidityWithProvider(LAST_APPRAISAL);
+    let warnings = summaryConsistencyWarnings(summary, LAST_APPRAISAL);
+
+    // One-shot regeneration if the summary contradicts the structured appraisal.
+    if (warnings.length > 0) {
+      const reinforcement = `\n\nThe previous draft had these consistency issues against the structured appraisal — fix them:\n${warnings.map(w => `- ${w}`).join('\n')}\nFollow the structured verdicts exactly. Do not call a claim unsupported when its structured verdict is package-supported, package-supported with caveat, weakly supported, or coverage gap. Do not treat ignored lexical constraints as substantive cross-frame tensions.`;
+      try {
+        const prompt = buildSoliditySummaryPrompt(LAST_APPRAISAL.input, LAST_APPRAISAL);
+        const retried = await generatePromptWithProvider(
+          providerConfig.provider,
+          prompt.systemPrompt + reinforcement,
+          prompt.userPrompt,
+          providerConfig.apiKey,
+          providerConfig.model
+        );
+        summary = retried;
+        warnings = summaryConsistencyWarnings(summary, LAST_APPRAISAL);
+      } catch (e) {
+        // Keep the first draft; surface the original warnings.
+      }
+    }
+
+    LAST_SOLIDITY_SUMMARY = summary;
+    LAST_SOLIDITY_SUMMARY_WARNINGS = warnings;
     LAST_SOLIDITY_NOTICE = null;
     const loading = document.getElementById('summary-loading');
     if (loading) loading.remove();
     showSoliditySummaryAboveAppraisal(LAST_SOLIDITY_SUMMARY);
+    if (warnings.length) {
+      // Re-render to surface the warnings card above the summary.
+      renderCurrentSolidityOutput();
+    }
   } catch (e) {
     const loading = document.getElementById('summary-loading');
     if (loading) loading.remove();
     showSolidityNoticeAboveAppraisal('Readable summary unavailable', e.message);
   }
+}
+
+function renderSummaryConsistencyWarningsCard(warnings) {
+  const div = document.createElement('div');
+  div.className = 'section section-G';
+  div.innerHTML = `
+    <div class="section-label"><span><span class="marker">!</span>Readable summary consistency check</span></div>
+    <div class="section-content">
+      <p style="margin-top:0;">The readable summary still disagrees with the structured appraisal on these points. The structured appraisal below is authoritative.</p>
+      <ul class="trace-list">${warnings.map(w => `<li>${escapeHtml(w)}</li>`).join('')}</ul>
+    </div>
+  `;
+  return div;
 }
 
 async function draftRepairedVersion() {
@@ -3619,6 +5487,7 @@ function clearActiveMode() {
     document.getElementById('appraise-text').value = '';
     LAST_APPRAISAL = null;
     LAST_SOLIDITY_SUMMARY = null;
+    LAST_SOLIDITY_SUMMARY_WARNINGS = [];
     LAST_SOLIDITY_NOTICE = null;
   } else if (mode === 'compare') {
     document.getElementById('compare-query').value = '';
@@ -3667,6 +5536,38 @@ for (const chip of document.querySelectorAll('.example-chip')) {
 // and cross-package tests, so they are guaranteed to exercise something
 // real about the architecture.
 const SCENARIOS = [
+  {
+    group: 'Solidity appraisal demos',
+    items: [
+      {
+        label: 'ML passage (LLM relevance filter regression)',
+        query: 'Machine learning is a computational approach to producing decision rules when the target function is unknown. It contrasts with traditional design, where a rule is derived analytically from given specifications; learning instead uses data as the primary evidence about how to map inputs to outputs.',
+        mode: 'solidity',
+        requires: ['ml_core'],
+        watch: 'Mechanical retrieval over-triggers constraints from political_science, biology, communication, medicine, economics, and CS via overloaded terms (decision rule, function, evidence, design). With the LLM relevance filter on and a provider key, those should land in ignored_lexical_constraints and the verdict should not be driven by them. ml_core remains primary.'
+      },
+      {
+        // Regression category: anaphoric continuation. Mechanical splitting
+        // appraises the second sentence in isolation; LLM extraction must
+        // resolve "this" before retrieval.
+        label: 'anaphoric continuation regression',
+        query: 'A market is a coordination mechanism that aggregates dispersed information through prices. This shows why central planners struggle with the same allocation problem.',
+        mode: 'solidity',
+        requires: ['economics_core'],
+        watch: 'With LLM claim extraction on, the second canonical claim should resolve "This" to the prior definition of the price mechanism, not be appraised in isolation as a generic claim about central planners.'
+      },
+      {
+        // Regression category: contrastive continuation. The contrast carries
+        // half its meaning in a prior clause; the canonical_claim should hold
+        // both sides.
+        label: 'contrastive continuation regression',
+        query: 'A statistical model assigns probabilities to outcomes given the data. This distinguishes it from a deterministic rule, which assigns a single outcome.',
+        mode: 'solidity',
+        requires: ['statistics_core'],
+        watch: 'The canonical claim of the second sentence should include both sides of the contrast — statistical model vs. deterministic rule — so retrieval doesn\'t treat "This distinguishes it" as a free-standing assertion.'
+      }
+    ]
+  },
   {
     group: 'TCog audit demos (architectural)',
     items: [
@@ -3820,6 +5721,18 @@ function escapeHtml(s) {
   }[c]));
 }
 
+async function runScenarioInMode(sc) {
+  const targetMode = sc.mode || 'ask';
+  setActiveMode(targetMode);
+  if (targetMode === 'solidity') {
+    document.getElementById('appraise-text').value = sc.query;
+    await runClaimAppraisal();
+  } else {
+    document.getElementById('query').value = sc.query;
+    await runQuery();
+  }
+}
+
 async function onScenarioClick(e) {
   const groupIdx = parseInt(e.currentTarget.dataset.group);
   const itemIdx = parseInt(e.currentTarget.dataset.item);
@@ -3827,9 +5740,7 @@ async function onScenarioClick(e) {
   const missing = sc.requires.filter(r => !isPkgLoaded(r));
 
   if (missing.length === 0) {
-    setActiveMode('ask');
-    document.getElementById('query').value = sc.query;
-    await runQuery();
+    await runScenarioInMode(sc);
     return;
   }
 
@@ -3872,9 +5783,7 @@ function showMissingPackagesBanner(scenario, missing) {
       showLoadStatus(`Bundle loaded, but still missing: ${stillMissing.join(', ')}`, true);
       return;
     }
-    setActiveMode('ask');
-    document.getElementById('query').value = scenario.query;
-    await runQuery();
+    await runScenarioInMode(scenario);
   });
 }
 
@@ -4023,8 +5932,226 @@ function validatePackageObject(obj) {
   return null;  // valid
 }
 
+// Non-fatal validator: surface mismatches between the safety_critical flag
+// and the constraint set. Authors may have legitimate reasons to deviate, so
+// these are warnings (console.warn), not load errors.
+function warnOnSafetyCriticalMismatch(pkg) {
+  const m = (pkg && pkg.manifest) || {};
+  const constraints = pkg.constraints || [];
+  const hasCriticalBlocking = constraints.some(c =>
+    c && c.blocks_answer === true && String(c.severity || '').toLowerCase() === 'critical');
+  if (m.safety_critical === true && !hasCriticalBlocking) {
+    console.warn(`[tcog] package ${m.package_id} declares safety_critical:true but has no constraints with severity:"critical" and blocks_answer:true. The flag does nothing without enforcement to back it up.`);
+  }
+  if (hasCriticalBlocking && m.safety_critical !== true) {
+    console.warn(`[tcog] package ${m.package_id} has critical blocking constraints but is NOT marked safety_critical:true. Review whether the flag should be set so the user-override gate respects this package's blocking.`);
+  }
+}
+
 function isDuplicate(pkg) {
   return LOADED_PACKAGES.some(p => p.manifest.package_id === pkg.manifest.package_id);
+}
+
+// ============================================================================
+// Covers-routed retrieval (TCog Protocol v0.3.1 §4.3–§4.5)
+// ============================================================================
+// Covers is metadata declared on a package manifest that names the concepts
+// the package is the authoritative home of. For definitional and procedural
+// queries we route via covers BEFORE broad cue-based retrieval — the
+// structural blind spot in cue-based routing is that a package may be the
+// canonical home of a concept but lack cues for the bare definitional
+// phrasing. Covers is purely additive and metadata-only: packages without
+// `manifest.covers` continue to participate in cue-based routing only.
+//
+// Mechanical-mode matching is intentional bidirectional substring containment
+// after a canonical normalization. This surfaces productive cross-package
+// overlaps (e.g. "function" surfaces in stats via "loss function",
+// combinatorics via "generating function"); the downstream LLM selection
+// stage disambiguates by scope qualifier. Do NOT add semantic similarity
+// here — that is a separate semantic-augmented mode and out of scope.
+// ============================================================================
+
+// Canonical normalizer used by package validators. Keep this exact — small
+// variations break covers matches.
+function normalizeForCovers(s) {
+  if (!s) return '';
+  s = String(s).toLowerCase();
+  s = s.replace(/[‘’']/g, '');
+  s = s.replace(/[-_]/g, ' ');
+  s = s.replace(/[^\w\s]/g, ' ');
+  s = s.replace(/\s+/g, ' ').trim();
+  return s;
+}
+
+// Per-package covers index. Built lazily and cached on the package object.
+function buildCoversIndexForPackage(pkg) {
+  const m = (pkg && pkg.manifest) || {};
+  const covers = m.covers;
+  if (!covers || typeof covers !== 'object' || !Array.isArray(covers.primary)) {
+    return null;
+  }
+  const primary = [];
+  for (const entry of covers.primary) {
+    if (!entry || typeof entry !== 'object') continue;
+    const concept = typeof entry.concept === 'string' ? entry.concept : '';
+    if (!concept) continue;
+    primary.push({
+      concept,
+      scope: typeof entry.scope === 'string' ? entry.scope : '',
+      normalized_concept: normalizeForCovers(concept)
+    });
+  }
+  const secondary = [];
+  if (covers.secondary_auto_indexed) {
+    for (const u of pkg.units || []) {
+      if (u && typeof u.label === 'string' && u.label) {
+        secondary.push({
+          label: u.label,
+          source: 'unit_label',
+          source_id: u.id || '',
+          normalized: normalizeForCovers(u.label)
+        });
+      }
+      if (u && Array.isArray(u.features)) {
+        for (const f of u.features) {
+          const text = typeof f === 'string' ? f : (f && f.label) || (f && f.name) || '';
+          if (text) {
+            secondary.push({
+              label: text,
+              source: 'unit_feature',
+              source_id: u.id || '',
+              normalized: normalizeForCovers(text)
+            });
+          }
+        }
+      }
+    }
+    for (const c of pkg.clusters || []) {
+      if (c && typeof c.label === 'string' && c.label) {
+        secondary.push({
+          label: c.label,
+          source: 'cluster_label',
+          source_id: c.id || '',
+          normalized: normalizeForCovers(c.label)
+        });
+      }
+    }
+  }
+  return {
+    primary,
+    secondary_auto_indexed: !!covers.secondary_auto_indexed,
+    secondary
+  };
+}
+
+function getCoversIndex(pkg) {
+  if (!pkg) return null;
+  if (pkg._coversIndex !== undefined) return pkg._coversIndex; // null is a valid cached result
+  pkg._coversIndex = buildCoversIndexForPackage(pkg);
+  return pkg._coversIndex;
+}
+
+// Query class detection (mechanical, pattern-based).
+function detectQueryClass(query) {
+  const q = String(query || '').trim();
+  if (!q) return 'other';
+  const lower = q.toLowerCase().replace(/[?.!]+$/g, '').trim();
+  if (/^(what is|what are|what does|what do)\b/.test(lower)) return 'definitional';
+  if (/\bdefinition of\b|\bmeaning of\b|^define\b|^explain (the )?(concept|definition|meaning) of\b/.test(lower)) return 'definitional';
+  if (/^how (do|can|should|would) i\b|^how to\b|\bprocedure for\b|\bsteps? to\b/.test(lower)) return 'procedural';
+  if (/^compare\b|\b(vs|versus)\b|\bdifference between\b/.test(lower)) return 'comparative';
+  if (/\b(audit|appraise|evaluate)\b/.test(lower)) return 'appraisal';
+  // Bare noun phrase 1–4 words with no verb-ish trailing — treat as definitional.
+  const tokens = lower.split(/\s+/).filter(Boolean);
+  if (tokens.length >= 1 && tokens.length <= 4) {
+    const verbish = /\b(is|are|was|were|be|been|being|do|does|did|has|have|had|will|would|should|can|could|may|might|must|shall|use|uses|used|run|runs|ran|make|makes|made|find|finds|found|show|shows|showed|prove|proves|proved|cause|causes|caused|imply|implies|mean|means|meant|distinguish|distinguishes|distinguished)\b/;
+    if (!verbish.test(lower)) return 'definitional';
+  }
+  return 'analytical';
+}
+
+function extractCoversTarget(query) {
+  let q = String(query || '').trim().replace(/[?.!]+$/g, '').trim();
+  q = q.replace(/^(what is|what are|what does|what do)\s+/i, '');
+  q = q.replace(/^define\s+/i, '');
+  q = q.replace(/^(definition of|meaning of)\s+/i, '');
+  q = q.replace(/^explain (the )?(concept|definition|meaning) of\s+/i, '');
+  q = q.replace(/^how (do|can|should|would) i\s+/i, '');
+  q = q.replace(/^how to\s+/i, '');
+  q = q.replace(/^(a|an|the)\s+/i, '');
+  q = q.replace(/\s+(mean|means|defined as)$/i, '');
+  return q.trim();
+}
+
+// Mechanical bidirectional containment match after normalization.
+function coversMatchTarget(target, conceptOrLabel) {
+  const tn = normalizeForCovers(target);
+  const cn = normalizeForCovers(conceptOrLabel);
+  if (!tn || !cn) return false;
+  return cn === tn || cn.includes(tn) || tn.includes(cn);
+}
+
+// Reuses the existing phrase-match the rest of the pipeline uses for
+// avoid_when. Returns true if any avoid_when entry phrase-matches the query.
+function queryHitsAvoidWhen(query, pkg) {
+  const policy = (pkg && pkg.manifest && pkg.manifest.activation_policy) || {};
+  const avoid = Array.isArray(policy.avoid_when) ? policy.avoid_when : [];
+  if (avoid.length === 0) return false;
+  const queryNorm = normalize(query || '');
+  return avoid.some(a => typeof a === 'string' && phraseMatchInQuery(a, queryNorm));
+}
+
+// Run covers-routed retrieval. Returns { query_class, target, matches } where
+// matches is an array of {package_id, package, concept, scope, role, source}.
+// avoid_when overrides covers (a package whose avoid_when matches is excluded
+// regardless of covers).
+function coversRoute(query) {
+  const query_class = detectQueryClass(query);
+  if (query_class !== 'definitional' && query_class !== 'procedural') {
+    return { query_class, target: null, matches: [] };
+  }
+  const target = extractCoversTarget(query);
+  if (!target) return { query_class, target, matches: [] };
+
+  const matches = [];
+  for (const pkg of LOADED_PACKAGES) {
+    const idx = getCoversIndex(pkg);
+    if (!idx) continue;
+    if (queryHitsAvoidWhen(query, pkg)) continue; // avoid_when overrides covers
+
+    let hit = false;
+    for (const entry of idx.primary) {
+      if (coversMatchTarget(target, entry.concept)) {
+        matches.push({
+          package_id: pkg.manifest.package_id,
+          package: pkg,
+          concept: entry.concept,
+          scope: entry.scope,
+          role: 'primary',
+          source: 'covers.primary'
+        });
+        hit = true;
+      }
+    }
+    // Secondary only if no primary match in this package, per spec ("Else if").
+    if (!hit && idx.secondary_auto_indexed) {
+      for (const entry of idx.secondary) {
+        if (coversMatchTarget(target, entry.label)) {
+          matches.push({
+            package_id: pkg.manifest.package_id,
+            package: pkg,
+            concept: entry.label,
+            scope: `(${entry.source}${entry.source_id ? ': ' + entry.source_id : ''})`,
+            role: 'auxiliary',
+            source: entry.source
+          });
+          // One secondary hit per package is enough to surface it; avoid spam.
+          break;
+        }
+      }
+    }
+  }
+  return { query_class, target, matches };
 }
 
 function loadPackageFromText(text, sourceName) {
@@ -4041,6 +6168,10 @@ function loadPackageFromText(text, sourceName) {
   }
   applyPackagePatch(obj);
   applyPackageIntegrationPatch(obj);
+  // Build the covers index eagerly now that the package is finalized. Packages
+  // without manifest.covers cache `null` and skip the covers stage cleanly.
+  obj._coversIndex = buildCoversIndexForPackage(obj);
+  warnOnSafetyCriticalMismatch(obj);
   LOADED_PACKAGES.push(obj);
   return { ok: true, pkg_id: obj.manifest.package_id };
 }

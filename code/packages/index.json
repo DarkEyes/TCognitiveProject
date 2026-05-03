@@ -1,6 +1,15 @@
 {
   "files": [
-    "ml_core.zip",
-    "tcog_field_basis_packages_v0_3_26.zip"
+    "algorithm_design_core_v0_4_0.zip",
+    "calculus_real_analysis_core_v0_2_0.zip",
+    "combinatorics_discrete_structures_core_v0_3_1.zip",
+    "graph_theory_core_v0_3_1.zip",
+    "linear_algebra_core_v0_2_0.zip",
+    "ml_core_v0_2_0.zip",
+    "probability_stats_core_v1_0_0.zip",
+    "scientific_methodology_core_v0_2_0.zip",
+    "set_theory_logic_core_v0_2_0.zip",
+    "tcog_field_basis_packages_v0_3_27.zip",
+    "theory_of_computation_core_v0_3_2.zip"
   ]
 }
