@@ -35,6 +35,7 @@
       <div class="controls">
         <button class="btn" id="appraise-claim">Run solidity appraisal</button>
         <label class="audit-toggle"><input type="checkbox" id="solidity-llm-claim-extraction" checked> Use LLM claim extraction</label>
+        <label class="audit-toggle"><input type="checkbox" id="use-llm-field-routing"> Use LLM field routing</label>
         <label class="audit-toggle"><input type="checkbox" id="solidity-llm-relevance-filter" checked> Use LLM relevance filter for non-primary constraints</label>
         <label class="audit-toggle"><input type="checkbox" id="solidity-llm-summary"> Add readable LLM summary</label>
         <button class="btn btn-secondary" id="summarize-appraisal" disabled>Summarize appraisal with LLM</button>
@@ -64,6 +65,7 @@
           <label><input type="radio" name="mode" value="mechanical" checked><span>Mechanical only</span></label>
           <label><input type="radio" name="mode" value="llm_guided"><span>LLM-guided TCog-R</span></label>
         </div>
+        <label class="audit-toggle"><input type="checkbox" id="ask-use-llm-field-routing"> Use LLM field routing</label>
       </div>
     </div>
 

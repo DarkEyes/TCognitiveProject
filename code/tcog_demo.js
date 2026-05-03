@@ -1919,6 +1919,394 @@ function parseLLMJsonStrict(text) {
   }
 }
 
+// ---------- Field-first routing ----------
+function compactText(value, max = 220) {
+  const text = Array.isArray(value) ? value.join(', ') : String(value || '');
+  return text.replace(/\s+/g, ' ').trim().slice(0, max);
+}
+
+function buildLoadedPackageSummaries(packages) {
+  return (packages || []).map(pkg => {
+    const m = pkg.manifest || {};
+    const policy = m.activation_policy || {};
+    return {
+      package_id: m.package_id || '',
+      title: m.title || m.name || m.label || m.package_id || '',
+      domain: m.domain || m.field || '',
+      description: compactText(m.description || m.frame_limits || policy.frame_limits || ''),
+      tags: (m.tags || []).slice(0, 12),
+      activate_when: (policy.activate_when || []).slice(0, 18),
+      avoid_when: (policy.avoid_when || []).slice(0, 12),
+      clusters: (pkg.clusters || []).slice(0, 24).map(c => ({
+        id: c.id,
+        label: c.label || ''
+      }))
+    };
+  }).filter(s => s.package_id);
+}
+
+function buildFieldReadingPrompt(text, loadedPackageSummaries) {
+  const systemPrompt = `You are the field-reading router for TCog-R. Read the user's text semantically and identify broad fields before clusters or units. You route only to loaded package ids supplied by the app. Do not answer the user. Return JSON only.`;
+  const userPrompt = `Text:
+${text}
+
+Loaded package summaries:
+${JSON.stringify(loadedPackageSummaries || [], null, 2)}
+
+Return ONLY a JSON object with this exact shape:
+
+{
+  "text_type": "definition_question | technical_question | argument | conversation | explanation | instruction | other",
+  "primary_fields": [
+    {
+      "field": "",
+      "reason": ""
+    }
+  ],
+  "secondary_fields": [
+    {
+      "field": "",
+      "reason": ""
+    }
+  ],
+  "candidate_packages": [
+    {
+      "package_id": "",
+      "role": "primary | secondary | background | warning",
+      "reason": ""
+    }
+  ],
+  "excluded_fields": [
+    {
+      "field": "",
+      "reason": ""
+    }
+  ],
+  "routing_note": ""
+}
+
+Rules:
+- Pick broad semantic fields before clusters/units.
+- Use loadedPackageSummaries to choose package IDs.
+- Do not invent package IDs.
+- If a relevant field has no loaded package, mention it in routing_note, not candidate_packages.
+- Distinguish technical definition/explanation from argument appraisal.
+- argument_quality_fallacy_core should be role "warning" unless the user explicitly asks to critique an argument, find fallacies, or evaluate reasoning.
+- Field picking is routing metadata, not evidence.
+- Return JSON only.`;
+  return { systemPrompt, userPrompt };
+}
+
+function normalizeFieldReadingTextType(value) {
+  const allowed = new Set(['definition_question', 'technical_question', 'argument', 'conversation', 'explanation', 'instruction', 'other']);
+  const v = String(value || '').trim().toLowerCase();
+  return allowed.has(v) ? v : 'other';
+}
+
+function validateFieldReading(fieldReading, loadedPackages) {
+  const warnings = [];
+  const loadedIds = new Set((loadedPackages || []).map(p => p.manifest?.package_id).filter(Boolean));
+  const roleMap = {
+    primary: 'primary',
+    main: 'primary',
+    secondary: 'secondary',
+    auxiliary: 'secondary',
+    background: 'background',
+    context: 'background',
+    warning: 'warning',
+    advisory: 'warning'
+  };
+  const raw = fieldReading && typeof fieldReading === 'object' ? fieldReading : {};
+  const normalized = {
+    text_type: normalizeFieldReadingTextType(raw.text_type),
+    primary_fields: Array.isArray(raw.primary_fields) ? raw.primary_fields.filter(x => x && typeof x === 'object').map(x => ({
+      field: String(x.field || '').trim(),
+      reason: String(x.reason || '').trim()
+    })).filter(x => x.field) : [],
+    secondary_fields: Array.isArray(raw.secondary_fields) ? raw.secondary_fields.filter(x => x && typeof x === 'object').map(x => ({
+      field: String(x.field || '').trim(),
+      reason: String(x.reason || '').trim()
+    })).filter(x => x.field) : [],
+    candidate_packages: [],
+    excluded_fields: Array.isArray(raw.excluded_fields) ? raw.excluded_fields.filter(x => x && typeof x === 'object').map(x => ({
+      field: String(x.field || '').trim(),
+      reason: String(x.reason || '').trim()
+    })).filter(x => x.field) : [],
+    routing_note: typeof raw.routing_note === 'string' ? raw.routing_note : '',
+    validation_warnings: warnings
+  };
+
+  const byPkg = new Map();
+  for (const entry of Array.isArray(raw.candidate_packages) ? raw.candidate_packages : []) {
+    if (!entry || typeof entry !== 'object') continue;
+    const packageId = typeof entry.package_id === 'string' ? entry.package_id.trim() : '';
+    if (!packageId) continue;
+    if (!loadedIds.has(packageId)) {
+      warnings.push(`field_reading: unknown package_id "${packageId}" dropped`);
+      continue;
+    }
+    const role = roleMap[String(entry.role || '').toLowerCase()] || 'background';
+    const reason = typeof entry.reason === 'string' ? entry.reason : '';
+    if (!byPkg.has(packageId)) {
+      byPkg.set(packageId, { package_id: packageId, role, reason });
+    } else {
+      const prev = byPkg.get(packageId);
+      const rank = { primary: 0, secondary: 1, warning: 2, background: 3 };
+      if (rank[role] < rank[prev.role]) prev.role = role;
+      if (reason && !prev.reason.includes(reason)) prev.reason = [prev.reason, reason].filter(Boolean).join(' ');
+      warnings.push(`field_reading: duplicate package_id "${packageId}" merged`);
+    }
+  }
+  normalized.candidate_packages = [...byPkg.values()];
+  if (normalized.candidate_packages.length === 0 && normalized.primary_fields.length > 0) {
+    warnings.push('field_reading: no valid package ids selected; preserving field-level reading only');
+  }
+  return normalized;
+}
+
+async function runLLMFieldReading(text, providerConfig) {
+  const summaries = buildLoadedPackageSummaries(LOADED_PACKAGES);
+  const prompt = buildFieldReadingPrompt(text, summaries);
+  const responseText = await generatePromptWithProvider(
+    providerConfig.provider,
+    prompt.systemPrompt,
+    prompt.userPrompt,
+    providerConfig.apiKey,
+    providerConfig.model
+  );
+  return validateFieldReading(parseLLMJsonStrict(responseText), LOADED_PACKAGES);
+}
+
+function isExplicitArgumentAppraisalRequest(text, fieldReading) {
+  const t = `${text || ''} ${fieldReading?.routing_note || ''}`.toLowerCase();
+  return /\b(critique|fallac|evaluate reasoning|argument quality|assess (?:the )?argument|appraise (?:the )?argument|valid argument|sound argument|missing warrant)\b/.test(t);
+}
+
+function scoreFieldRouteText(text, fields, parts) {
+  const q = normalize([text, ...(fields || []).map(f => f.field || f)].join(' '));
+  let score = 0;
+  const matched = [];
+  for (const part of parts || []) {
+    if (!part) continue;
+    const s = String(part);
+    if (phraseMatchInQuery(s, q)) {
+      score += s.includes(' ') ? 2 : 1;
+      matched.push(s);
+    }
+  }
+  return { score, matched: [...new Set(matched)] };
+}
+
+function clusterMembers(pkg, cluster) {
+  const ids = new Set(cluster?.members || []);
+  return (pkg.units || []).filter(u => ids.has(u.id));
+}
+
+function looksLikeTopLevelUnit(unit) {
+  const hay = `${unit.id || ''} ${unit.label || ''} ${unit.definition || ''}`.toLowerCase();
+  return /\b(definition|define|overview|intro|core|basic|concept|foundation|what is|means)\b/.test(hay);
+}
+
+function expandFieldRoutedPackage(pkg, text, fieldReading) {
+  const fields = (fieldReading?.primary_fields || []).concat(fieldReading?.secondary_fields || []);
+  const scored = (pkg.clusters || []).map(c => {
+    const parts = [c.label, c.description].concat(c.cues || []);
+    const s = scoreFieldRouteText(text, fields, parts);
+    const topBonus = /\b(definition|overview|core|intro|concept|foundation)\b/i.test(`${c.id || ''} ${c.label || ''}`) ? 0.5 : 0;
+    return { cluster: c, score: s.score + topBonus, matched: s.matched };
+  }).sort((a, b) => b.score - a.score);
+  const expandedClusters = scored
+    .filter(s => s.score > 0)
+    .slice(0, 3);
+  const fallbackClusters = expandedClusters.length
+    ? []
+    : scored.slice(0, 2).filter(s => s.cluster);
+  const chosenClusters = expandedClusters.concat(fallbackClusters).slice(0, 3);
+  const unitById = new Map();
+  for (const item of chosenClusters) {
+    for (const u of clusterMembers(pkg, item.cluster)) unitById.set(u.id, u);
+  }
+  const fieldText = fields.map(f => f.field).join(' ');
+  const topUnits = (pkg.units || [])
+    .map(u => {
+      const s = scoreFieldRouteText(`${text} ${fieldText}`, [], [u.label, u.definition].concat(u.features || []));
+      return { unit: u, score: s.score + (looksLikeTopLevelUnit(u) ? 1 : 0) };
+    })
+    .filter(s => s.score > 0)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 3);
+  for (const item of topUnits) unitById.set(item.unit.id, item.unit);
+
+  return {
+    package_id: pkg.manifest.package_id,
+    expanded_clusters: chosenClusters.map(item => ({
+      id: item.cluster.id,
+      label: item.cluster.label || '',
+      score: item.score,
+      matched: item.matched || []
+    })),
+    expanded_units: [...unitById.values()].slice(0, 5).map(u => ({
+      id: u.id,
+      label: u.label || ''
+    })),
+    expansion_reason: chosenClusters.some(c => c.score > 0)
+      ? 'overview/top-level clusters chosen by label/cue match to query or field reading'
+      : 'no cluster matched field text; included first available overview candidates for selector inspection'
+  };
+}
+
+function packageCandidateFromPkg(pkg, role, reason, supportLevel = 'package') {
+  return {
+    id: pkg.manifest.package_id,
+    domain: pkg.manifest.domain || '',
+    role,
+    candidate_reason: reason || 'llm_field_routing',
+    support_level: supportLevel,
+    evidence: false
+  };
+}
+
+function mergeFieldPayloadCandidate(payload, kind, item) {
+  const key = kind === 'candidate_packages' ? 'id' : 'id';
+  mergeCandidateById(payload[kind], [item], key);
+}
+
+function buildFieldFirstCandidatePayload(text, fieldReading, loadedPackages) {
+  const base = retrieveWithGuidance(text, { interpreted_query: text, search_queries: [] });
+  base.field_reading = fieldReading || null;
+  base.field_routing_warnings = (fieldReading && fieldReading.validation_warnings) || [];
+  base.field_expansions = [];
+
+  const loadedById = new Map((loadedPackages || []).map(p => [p.manifest?.package_id, p]));
+  const explicitArgument = isExplicitArgumentAppraisalRequest(text, fieldReading);
+  const fieldPackageIds = new Set();
+
+  for (const cp of fieldReading?.candidate_packages || []) {
+    const pkg = loadedById.get(cp.package_id);
+    if (!pkg) continue;
+    fieldPackageIds.add(cp.package_id);
+    const role = cp.role || 'background';
+    mergeFieldPayloadCandidate(base, 'candidate_packages', packageCandidateFromPkg(pkg, role, 'llm_field_routing', role === 'primary' ? 'package' : 'field'));
+
+    const alreadyHasCluster = (base.candidate_clusters || []).some(c => c.package_id === cp.package_id);
+    if (role === 'warning' && !explicitArgument) {
+      const warningClusters = (pkg.clusters || []).filter(c => /\b(warn|fallac|argument|warrant|reason|critique)\b/i.test(`${c.id || ''} ${c.label || ''} ${c.description || ''}`)).slice(0, 3);
+      for (const c of warningClusters) {
+        mergeFieldPayloadCandidate(base, 'candidate_clusters', {
+          id: c.id,
+          label: c.label || '',
+          package_id: cp.package_id,
+          score: 0.25,
+          cues: [],
+          candidate_reason: 'llm_field_routing_warning',
+          support_level: 'field',
+          evidence: false
+        });
+      }
+      for (const c of (pkg.constraints || []).filter(c => /\b(warn|fallac|argument|warrant|reason|category shift)\b/i.test(`${c.id || ''} ${c.label || ''} ${c.rule || ''}`)).slice(0, 6)) {
+        mergeFieldPayloadCandidate(base, 'candidate_constraints', {
+          id: c.id,
+          label: c.label || '',
+          rule: c.rule || '',
+          repair: c.repair || '',
+          severity: c.severity || '',
+          blocks_answer: !!c.blocks_answer,
+          package_id: cp.package_id,
+          safety_critical: isPackageSafetyCritical(pkg),
+          advisory: true,
+          candidate_reason: 'llm_field_routing_warning'
+        });
+      }
+      continue;
+    }
+
+    if (!alreadyHasCluster) {
+      const expansion = expandFieldRoutedPackage(pkg, text, fieldReading);
+      base.field_expansions.push(expansion);
+      for (const c of expansion.expanded_clusters) {
+        mergeFieldPayloadCandidate(base, 'candidate_clusters', {
+          id: c.id,
+          label: c.label || '',
+          package_id: cp.package_id,
+          score: c.score || 0.25,
+          cues: c.matched || [],
+          candidate_reason: 'field_routed_package_expansion',
+          support_level: 'cluster',
+          evidence: false
+        });
+      }
+      for (const uRef of expansion.expanded_units) {
+        const u = (pkg.units || []).find(x => x.id === uRef.id);
+        if (u) {
+          mergeFieldPayloadCandidate(base, 'candidate_units', {
+            id: u.id,
+            label: u.label || '',
+            definition: u.definition || '',
+            package_id: cp.package_id,
+            anchors: u.anchors || [],
+            candidate_reason: 'field_routed_package_expansion'
+          });
+        }
+      }
+    }
+  }
+
+  // Prevent false cross-frame conflicts: only packages selected by field
+  // routing can contribute constraints to this LLM-guided verdict.
+  if (fieldPackageIds.size > 0) {
+    base.candidate_constraints = (base.candidate_constraints || []).filter(c =>
+      fieldPackageIds.has(c.package_id)
+    );
+  }
+
+  return base;
+}
+
+function computeSupportDepth(fieldReading, candidatePayload, selectedEvidence, constraints) {
+  const selectedUnits = selectedEvidence?.selected_units || selectedEvidence?.units || [];
+  const selectedConstraints = selectedEvidence?.selected_constraints || selectedEvidence?.constraints || [];
+  const blocking = (constraints || []).some(c => c && (c.blocks_answer || c.blocks));
+  const fieldRecognized = !!(fieldReading && ((fieldReading.primary_fields || []).length || (fieldReading.secondary_fields || []).length));
+  const validPackages = (candidatePayload?.candidate_packages || []).filter(p => p.candidate_reason === 'llm_field_routing' || p.support_level === 'field' || p.support_level === 'package');
+  const hasPackages = (candidatePayload?.candidate_packages || []).length > 0;
+  const hasClusters = (candidatePayload?.candidate_clusters || []).length > 0;
+  const hasUnits = selectedUnits.length > 0 || (candidatePayload?.candidate_units || []).length > 0;
+  let support_depth = 'unsupported';
+  if (blocking) support_depth = 'conflict_or_constraint_block';
+  else if (selectedUnits.length > 0 && selectedConstraints.length > 0) support_depth = 'unit_supported_with_constraints';
+  else if (selectedUnits.length > 0) support_depth = 'unit_supported';
+  else if (hasClusters && !selectedUnits.length) support_depth = 'cluster_candidate_no_unit';
+  else if (validPackages.length > 0 || (fieldRecognized && hasPackages)) support_depth = 'package_candidate_no_cluster';
+  else if (fieldRecognized) support_depth = 'field_recognized_no_package';
+  return {
+    support_depth,
+    field_status: fieldRecognized
+      ? `recognized: ${(fieldReading.primary_fields || []).map(f => f.field).join(', ') || 'field present'}`
+      : 'not recognized',
+    package_status: hasPackages
+      ? `${(candidatePayload.candidate_packages || []).length} package candidate(s)`
+      : 'no package candidate',
+    cluster_status: hasClusters
+      ? `${(candidatePayload.candidate_clusters || []).length} cluster candidate(s)`
+      : 'no cluster candidate',
+    unit_status: selectedUnits.length
+      ? `${selectedUnits.length} selected unit(s)`
+      : (hasUnits ? 'unit candidates exist but none selected' : 'no unit support'),
+    constraint_status: blocking
+      ? 'blocking constraint present'
+      : (selectedConstraints.length ? `${selectedConstraints.length} selected constraint(s)` : 'no selected constraints'),
+    diagnosis: {
+      field_recognized_no_package: 'Field recognized, but no loaded package was validated for that field.',
+      package_candidate_no_cluster: 'Package candidate found through LLM field routing; cluster activation is weak or absent.',
+      cluster_candidate_no_unit: 'Cluster candidate found, but unit-level package support is incomplete.',
+      unit_supported: 'Unit-level package support found.',
+      unit_supported_with_constraints: 'Unit-level package support found with applicable constraints.',
+      conflict_or_constraint_block: 'A relevant constraint blocks or materially limits the answer.',
+      unsupported: 'No field, package, cluster, or unit support was found.'
+    }[support_depth]
+  };
+}
+
 // ---------- TASK 2: query understanding ----------
 function buildQueryUnderstandingPrompt(query) {
   const systemPrompt = `You are the query-understanding layer for TCog-R. Your job is to propose retrieval guidance only. Do not answer the user. Do not add external facts. Do not invent package ids. Return JSON only.`;
@@ -2106,7 +2494,7 @@ function retrieveWithGuidance(query, guidance) {
 // ---------- TASK 4: LLM candidate-selection prompt ----------
 function buildCandidateSelectionPrompt(query, candidatePayload) {
   const pkgList = (candidatePayload.candidate_packages || [])
-    .map(p => `- ${p.id} (${p.domain || '—'})`).join('\n') || '(none)';
+    .map(p => `- ${p.id} (${p.domain || '—'}) role=${p.role || 'mechanical'} support_level=${p.support_level || 'unit_or_cluster'} reason=${p.candidate_reason || 'mechanical'}`).join('\n') || '(none)';
   const clusterList = (candidatePayload.candidate_clusters || [])
     .map(c => `- ${c.id} [pkg ${c.package_id}] score ${c.score}: ${c.label}`).join('\n') || '(none)';
   const unitList = (candidatePayload.candidate_units || [])
@@ -2118,6 +2506,15 @@ function buildCandidateSelectionPrompt(query, candidatePayload) {
   const suppressedList = (candidatePayload.suppressed_packages || [])
     .map(s => `- ${s.package_id} [${s.reason}] ${s.detail || ''}`).join('\n') || '(none)';
   const guidance = candidatePayload.guidance || {};
+  const fr = candidatePayload.field_reading || null;
+  const fieldReadingBlock = fr ? JSON.stringify({
+    text_type: fr.text_type,
+    primary_fields: fr.primary_fields || [],
+    secondary_fields: fr.secondary_fields || [],
+    candidate_packages: fr.candidate_packages || [],
+    excluded_fields: fr.excluded_fields || [],
+    routing_note: fr.routing_note || ''
+  }, null, 2) : '(not used)';
   const guidanceBlock = JSON.stringify({
     interpreted_query: guidance.interpreted_query || '',
     domain_hints: guidance.domain_hints || [],
@@ -2140,6 +2537,9 @@ ${query}
 
 Query-understanding guidance:
 ${guidanceBlock}
+
+Field-first routing metadata (routing only, NOT evidence):
+${fieldReadingBlock}
 
 ${coversHeader}
 Covers matches:
@@ -2165,10 +2565,14 @@ ${suppressedList}
 
 Rules:
 - Use only ids that appear above. Do NOT invent ids.
+- Field-first package candidates are routing metadata, not unit-level support.
+- Do not treat field-level recognition as evidence. Select units only when candidate_units contain exact relevant support.
+- Package-level candidates may be primary_frames even when no cluster/unit support exists; record that as a coverage_gaps entry.
 - Drop irrelevant candidates explicitly via dropped_frames.
 - Choose primary_frames and auxiliary_frames from candidate_packages only.
 - selected_units must be a subset of the candidate units list.
 - selected_constraints must be a subset of the candidate constraints list.
+- Warning packages are advisory unless the user explicitly asked to critique an argument or evaluate reasoning.
 - If any candidate constraint has blocks_answer=true and is relevant, include it in blocking_constraints.
 - Suppressed packages must NOT be selected as evidence.
 - If no adequate package support exists for the query, list specific issues in coverage_gaps.
@@ -2247,7 +2651,7 @@ function validateLLMSelection(selection, candidatePayload) {
 
   // Force-include any mechanically blocking constraint, even if LLM omitted it.
   const llmBlocking = filterIds('blocking_constraints', selection.blocking_constraints, candidateConstraintIds);
-  const mechBlocking = (candidatePayload.candidate_constraints || []).filter(c => c.blocks_answer).map(c => c.id);
+  const mechBlocking = (candidatePayload.candidate_constraints || []).filter(c => c.blocks_answer && !c.advisory).map(c => c.id);
   const blocking_constraints = Array.from(new Set([...llmBlocking, ...mechBlocking]));
   for (const id of mechBlocking) {
     if (!llmBlocking.includes(id)) {
@@ -2293,7 +2697,7 @@ function validateLLMSelection(selection, candidatePayload) {
 }
 
 // ---------- TASK 6: mechanical constraint gate ----------
-function applyConstraintGate(validatedSelection, candidatePayload) {
+function applyConstraintGate(validatedSelection, candidatePayload, supportDepth = null) {
   const blocking = validatedSelection.blocking_constraints || [];
   const hasUnits = (validatedSelection.selected_units || []).length > 0;
   const hasCandidates =
@@ -2307,7 +2711,7 @@ function applyConstraintGate(validatedSelection, candidatePayload) {
   } else if (hasUnits) {
     disposition = 'selection_grounded_answer';
   } else if (hasCandidates) {
-    disposition = 'coverage_gap';
+    disposition = supportDepth?.support_depth || 'coverage_gap';
   } else {
     disposition = 'no_package_support';
   }
@@ -2332,6 +2736,7 @@ function applyConstraintGate(validatedSelection, candidatePayload) {
     disposition,
     blocking_constraints: blocking,
     repair_questions,
+    support_depth: supportDepth,
     safety_critical_blocked,
     safety_critical_blocking,
     user_overridden: false,
@@ -2365,6 +2770,9 @@ function buildSelectionGroundedCompositionPrompt(query, candidatePayload, valida
   const dispositionGuidance = {
     selection_grounded_answer: 'Compose a concise package-bound answer using ONLY the selected units. Cite each factual claim by appending [unit_id] using exact ids. Surface any selected constraints inline.',
     blocked_by_constraint: 'A blocking constraint fired. Do NOT assert a direct answer. Surface the constraint, present the repair question, and explain in plain language why this query cannot be reduced to a yes/no until the repair question is answered.',
+    field_recognized_no_package: 'State that the broad field was recognized, but no loaded package was validated for that field. Do NOT answer from training memory.',
+    package_candidate_no_cluster: 'State that a package candidate was found through field routing, but detailed cluster/unit support is incomplete. Do NOT answer from training memory.',
+    cluster_candidate_no_unit: 'State that cluster-level candidates exist, but no validated unit-level support was selected. Do NOT answer from training memory.',
     coverage_gap: 'No selected units passed validation. State plainly that the loaded packages do not provide adequate support, and summarise the coverage gap. Do NOT invent claims.',
     no_package_support: 'No package candidates exist for this query. State this plainly. Do NOT answer from training memory.'
   }[gatedResult.disposition] || '';
@@ -2401,6 +2809,9 @@ ${droppedBlock}
 === Coverage gaps ===
 ${coverageBlock}
 
+=== Support-depth diagnosis ===
+${gatedResult.support_depth ? JSON.stringify(gatedResult.support_depth, null, 2) : '(not computed)'}
+
 === Answer plan (LLM-proposed; treat as outline only) ===
 ${planBlock}
 
@@ -2414,6 +2825,7 @@ async function runLLMGuidedTCogR(query, providerConfig) {
   LAST_LLM_GUIDED_PROVIDER = providerConfig || null;
   const result = {
     query,
+    fieldReading: null,
     guidance: null,
     candidatePayload: null,
     rawSelection: null,
@@ -2435,7 +2847,26 @@ async function runLLMGuidedTCogR(query, providerConfig) {
     return result;
   }
 
-  // 1. Query understanding
+  const fieldRoutingEnabled = isLLMFieldRoutingEnabled();
+
+  // 1. LLM field reading
+  if (fieldRoutingEnabled) {
+    try {
+      result.fieldReading = await runLLMFieldReading(query, providerConfig);
+    } catch (e) {
+      result.errors.push(`Field reading failed: ${e.message}`);
+      result.fieldReading = validateFieldReading({
+        text_type: 'other',
+        primary_fields: [],
+        secondary_fields: [],
+        candidate_packages: [],
+        excluded_fields: [],
+        routing_note: 'LLM field reading failed; falling back to mechanical routing.'
+      }, LOADED_PACKAGES);
+    }
+  }
+
+  // 2. Query understanding, retained as a broadening aid after field reading.
   try {
     const qu = buildQueryUnderstandingPrompt(query);
     const guidanceText = await generatePromptWithProvider(
@@ -2448,9 +2879,26 @@ async function runLLMGuidedTCogR(query, providerConfig) {
     result.guidance = { interpreted_query: query, search_queries: [] };
   }
 
-  // 2. Broad mechanical candidate retrieval
+  // 3. Candidate construction
   try {
-    result.candidatePayload = retrieveWithGuidance(query, result.guidance);
+    result.candidatePayload = result.fieldReading
+      ? buildFieldFirstCandidatePayload(query, result.fieldReading, LOADED_PACKAGES)
+      : retrieveWithGuidance(query, result.guidance);
+    if (result.candidatePayload && result.guidance) {
+      result.candidatePayload.guidance = result.guidance;
+      const guidedPayload = retrieveWithGuidance(query, result.guidance);
+      mergeCandidateById(result.candidatePayload.candidate_packages, guidedPayload.candidate_packages, 'id');
+      mergeCandidateById(result.candidatePayload.candidate_clusters, guidedPayload.candidate_clusters, 'id');
+      mergeCandidateById(result.candidatePayload.candidate_units, guidedPayload.candidate_units, 'id');
+      mergeCandidateById(result.candidatePayload.candidate_constraints, guidedPayload.candidate_constraints, 'id');
+      mergeCandidateById(result.candidatePayload.candidate_trajectories, guidedPayload.candidate_trajectories, 'id');
+      for (const t of guidedPayload.mechanical_traces || []) result.candidatePayload.mechanical_traces.push(t);
+      if (result.fieldReading && result.fieldReading.candidate_packages?.length) {
+        const selectedFieldPkgIds = new Set(result.fieldReading.candidate_packages.map(p => p.package_id));
+        result.candidatePayload.candidate_constraints = (result.candidatePayload.candidate_constraints || [])
+          .filter(c => selectedFieldPkgIds.has(c.package_id));
+      }
+    }
   } catch (e) {
     result.errors.push(`Candidate retrieval failed: ${e.message}`);
   }
@@ -2468,7 +2916,7 @@ async function runLLMGuidedTCogR(query, providerConfig) {
   result.mechanicalTrace = baseTrace;
   result.mechanicalSections = buildRawResponse(query, baseTrace);
 
-  // 3. LLM candidate selection
+  // 4. LLM candidate selection
   try {
     const sel = buildCandidateSelectionPrompt(query, result.candidatePayload);
     const selText = await generatePromptWithProvider(
@@ -2485,13 +2933,26 @@ async function runLLMGuidedTCogR(query, providerConfig) {
     return result;
   }
 
-  // 4. Mechanical validation
+  // 5. Mechanical validation
   result.validatedSelection = validateLLMSelection(result.rawSelection, result.candidatePayload);
 
-  // 5. Mechanical constraint gate
-  result.gatedResult = applyConstraintGate(result.validatedSelection, result.candidatePayload);
+  // 6. Structured support-depth diagnosis and mechanical constraint gate
+  const selectedConstraintIds = Array.from(new Set([
+    ...(result.validatedSelection.selected_constraints || []),
+    ...(result.validatedSelection.blocking_constraints || [])
+  ]));
+  const selectedConstraintObjects = selectedConstraintIds
+    .map(cid => (result.candidatePayload.candidate_constraints || []).find(c => c.id === cid))
+    .filter(Boolean);
+  result.supportDepth = computeSupportDepth(
+    result.fieldReading,
+    result.candidatePayload,
+    result.validatedSelection,
+    selectedConstraintObjects
+  );
+  result.gatedResult = applyConstraintGate(result.validatedSelection, result.candidatePayload, result.supportDepth);
 
-  // 6. Selection-grounded answer composition
+  // 7. Selection-grounded answer composition
   try {
     const cmp = buildSelectionGroundedCompositionPrompt(
       query, result.candidatePayload, result.validatedSelection, result.gatedResult
@@ -2534,6 +2995,42 @@ function renderQueryUnderstandingCard(guidance) {
       <div class="trace-row"><div class="trace-row-label">Must-include terms</div><div class="trace-row-body">${includes}</div></div>
       <div class="trace-row"><div class="trace-row-label">Must-exclude frames</div><div class="trace-row-body">${exclude}</div></div>
       <div class="trace-row"><div class="trace-row-label">Auxiliary checks</div><div class="trace-row-body">${aux}</div></div>
+    </div>
+  `;
+  return div;
+}
+
+function renderFieldRoutingTrace(fieldReading, supportDepth = null) {
+  const div = document.createElement('div');
+  div.className = 'section section-A';
+  const fr = fieldReading || {};
+  const primary = renderListBlock(fr.primary_fields || [], 'No primary fields.', f =>
+    `<li><strong>${escapeHtml(f.field || '')}</strong>${f.reason ? ` — ${escapeHtml(f.reason)}` : ''}</li>`);
+  const secondary = renderListBlock(fr.secondary_fields || [], 'No secondary fields.', f =>
+    `<li><strong>${escapeHtml(f.field || '')}</strong>${f.reason ? ` — ${escapeHtml(f.reason)}` : ''}</li>`);
+  const packages = renderListBlock(fr.candidate_packages || [], 'No candidate packages from field routing.', p =>
+    `<li><code>${escapeHtml(p.package_id)}</code> <span class="status-pill" style="background:rgba(45,74,62,0.10); color:var(--accent-2);">${escapeHtml(p.role || 'background')}</span>${p.reason ? ` — ${escapeHtml(p.reason)}` : ''}</li>`);
+  const excluded = renderListBlock(fr.excluded_fields || [], 'No excluded fields.', f =>
+    `<li><strong>${escapeHtml(f.field || '')}</strong>${f.reason ? ` — ${escapeHtml(f.reason)}` : ''}</li>`);
+  const warnings = renderListBlock(fr.validation_warnings || [], 'No validation warnings.', w => `<li>${escapeHtml(w)}</li>`);
+  const depthRows = supportDepth ? `
+    <div class="trace-row"><div class="trace-row-label">Package status</div><div class="trace-row-body">${escapeHtml(supportDepth.package_status)}</div></div>
+    <div class="trace-row"><div class="trace-row-label">Cluster status</div><div class="trace-row-body">${escapeHtml(supportDepth.cluster_status)}</div></div>
+    <div class="trace-row"><div class="trace-row-label">Unit status</div><div class="trace-row-body">${escapeHtml(supportDepth.unit_status)}</div></div>
+    <div class="trace-row"><div class="trace-row-label">Constraint status</div><div class="trace-row-body">${escapeHtml(supportDepth.constraint_status)}</div></div>
+    <div class="trace-row"><div class="trace-row-label">Support depth</div><div class="trace-row-body"><code>${escapeHtml(supportDepth.support_depth)}</code><div style="font-size:12px; color:var(--ink-soft); margin-top:2px;">${escapeHtml(supportDepth.diagnosis || '')}</div></div></div>
+  ` : '';
+  div.innerHTML = `
+    <div class="section-label"><span>Field-first routing</span><span style="color:var(--ink-faint);">routing metadata, not evidence</span></div>
+    <div class="section-content">
+      <div class="trace-row"><div class="trace-row-label">Text type</div><div class="trace-row-body"><code>${escapeHtml(fr.text_type || 'not_used')}</code></div></div>
+      <div class="trace-row"><div class="trace-row-label">Primary fields</div><div class="trace-row-body">${primary}</div></div>
+      <div class="trace-row"><div class="trace-row-label">Secondary fields</div><div class="trace-row-body">${secondary}</div></div>
+      <div class="trace-row"><div class="trace-row-label">Candidate packages</div><div class="trace-row-body">${packages}</div></div>
+      <div class="trace-row"><div class="trace-row-label">Excluded fields</div><div class="trace-row-body">${excluded}</div></div>
+      <div class="trace-row"><div class="trace-row-label">Routing note</div><div class="trace-row-body">${escapeHtml(fr.routing_note || '—')}</div></div>
+      <div class="trace-row"><div class="trace-row-label">Validation</div><div class="trace-row-body">${warnings}</div></div>
+      ${depthRows}
     </div>
   `;
   return div;
@@ -2585,9 +3082,10 @@ function renderTcogRGuidedAnswerCard(answerText, gatedResult) {
       .replace(/\n/g, ' ');
     body = `<div class="section-content"><p>${renderCitations(html)}</p></div>`;
   } else {
-    const note = gatedResult && gatedResult.disposition === 'no_package_support'
-      ? 'No package candidates were retrieved for this query.'
-      : 'Composition unavailable.';
+    const note = gatedResult?.support_depth?.diagnosis ||
+      (gatedResult && gatedResult.disposition === 'no_package_support'
+        ? 'No package candidates were retrieved for this query.'
+        : 'Composition unavailable.');
     body = `<div class="section-content"><p style="color:var(--ink-faint);"><em>${escapeHtml(note)}</em></p></div>`;
   }
   div.innerHTML = `<div class="section-label"><span>TCog-R answer (selection-grounded)</span></div>${body}`;
@@ -2606,6 +3104,9 @@ function renderConstraintGateCard(gatedResult, candidatePayload) {
   });
   const repairHtml = renderListBlock(gatedResult.repair_questions || [], 'No repair questions.', r =>
     `<li><code>${escapeHtml(r.constraint_id)}</code>: ${escapeHtml(r.repair || '')}</li>`);
+  const supportDepthHtml = gatedResult.support_depth
+    ? `<div class="trace-row"><div class="trace-row-label">Support depth</div><div class="trace-row-body"><code>${escapeHtml(gatedResult.support_depth.support_depth)}</code><div style="font-size:12px; color:var(--ink-soft); margin-top:2px;">${escapeHtml(gatedResult.support_depth.diagnosis || '')}</div></div></div>`
+    : '';
 
   const dispositionBadge = gatedResult.user_overridden
     ? `${escapeHtml(gatedResult.disposition || '—')} (user_overridden)`
@@ -2636,6 +3137,7 @@ function renderConstraintGateCard(gatedResult, candidatePayload) {
     <div class="section-content">
       <div class="trace-row"><div class="trace-row-label">Blocking constraints</div><div class="trace-row-body">${blockingHtml}${overrideButtonHtml}</div></div>
       <div class="trace-row"><div class="trace-row-label">Repair questions</div><div class="trace-row-body">${repairHtml}</div></div>
+      ${supportDepthHtml}
       ${safetyNoteHtml}
       ${overriddenNoteHtml}
     </div>
@@ -2723,6 +3225,8 @@ function renderCandidateTraceDetails(candidatePayload, mechanicalSections) {
     s => `<li><code>${escapeHtml(s.package_id)}</code> [${escapeHtml(s.reason)}] ${escapeHtml(s.detail || '')}</li>`);
   const frameIssues = renderListBlock(candidatePayload.frame_issues || [], 'No frame issues.',
     i => `<li>[${escapeHtml(i.kind)}] ${escapeHtml(i.message)}</li>`);
+  const expansions = renderListBlock(candidatePayload.field_expansions || [], 'No field-routed expansions.',
+    e => `<li><code>${escapeHtml(e.package_id)}</code> — ${escapeHtml(e.expansion_reason || '')}<div style="font-size:12px; color:var(--ink-soft);">clusters: ${(e.expanded_clusters || []).map(c => `<code>${escapeHtml(c.id)}</code>`).join(', ') || 'none'} · units: ${(e.expanded_units || []).map(u => `<code>${escapeHtml(u.id)}</code>`).join(', ') || 'none'}</div></li>`);
 
   details.innerHTML = `
     <summary>Broad mechanical candidates and full protocol trace</summary>
@@ -2733,6 +3237,7 @@ function renderCandidateTraceDetails(candidatePayload, mechanicalSections) {
         <div class="trace-row"><div class="trace-row-label">Candidate clusters</div><div class="trace-row-body">${clusters}</div></div>
         <div class="trace-row"><div class="trace-row-label">Candidate units</div><div class="trace-row-body">${units}</div></div>
         <div class="trace-row"><div class="trace-row-label">Candidate constraints</div><div class="trace-row-body">${constraints}</div></div>
+        <div class="trace-row"><div class="trace-row-label">Field expansions</div><div class="trace-row-body">${expansions}</div></div>
         <div class="trace-row"><div class="trace-row-label">Suppressed packages</div><div class="trace-row-body">${suppressed}</div></div>
         <div class="trace-row"><div class="trace-row-label">Frame issues</div><div class="trace-row-body">${frameIssues}</div></div>
       </div>
@@ -2791,6 +3296,9 @@ function renderLLMGuidedResult(result) {
     out.appendChild(renderConstraintsCard(result.mechanicalSections));
   }
 
+  if (result.fieldReading) {
+    out.appendChild(renderFieldRoutingTrace(result.fieldReading, result.supportDepth || result.gatedResult?.support_depth));
+  }
   out.appendChild(renderQueryUnderstandingCard(result.guidance));
 
   // Surface covers matches above the LLM selection card so users can see what
@@ -3468,6 +3976,68 @@ function appraiseExtractedClaim(extracted) {
   return appraisal;
 }
 
+async function addFieldRoutingToAppraisal(appraisal, providerConfig) {
+  const errors = [];
+  await Promise.all((appraisal.claims || []).map(async claim => {
+    try {
+      const claimText = claim.canonical_claim || claim.sentence;
+      const fieldReading = await runLLMFieldReading(claimText, providerConfig);
+      const candidatePayload = buildFieldFirstCandidatePayload(claimText, fieldReading, LOADED_PACKAGES);
+      const selectedPkgRoles = new Map((fieldReading.candidate_packages || []).map(p => [p.package_id, p.role]));
+      const selectedPkgIds = new Set(selectedPkgRoles.keys());
+      const warningPkgIds = new Set([...selectedPkgRoles.entries()].filter(([, role]) => role === 'warning').map(([id]) => id));
+      const filteredTrace = Object.assign({}, claim.trace, {
+        triggered_constraints: (claim.trace.triggered_constraints || []).filter(t => {
+          if (selectedPkgIds.size === 0) return true;
+          if (warningPkgIds.has(t.package_id)) return false;
+          return selectedPkgIds.has(t.package_id);
+        })
+      });
+      const selectedUnits = (claim.units || []).filter(u => selectedPkgIds.size === 0 || selectedPkgIds.has(unitPackageId(u)));
+      const supportDepth = computeSupportDepth(fieldReading, candidatePayload, {
+        selected_units: selectedUnits.map(u => u.id),
+        selected_constraints: filteredTrace.triggered_constraints.map(t => t.constraint.id)
+      }, filteredTrace.triggered_constraints.map(t => t.constraint));
+
+      claim.field_reading = fieldReading;
+      claim.field_candidate_payload = candidatePayload;
+      claim.support_depth = supportDepth;
+      claim.warning_level = 'none';
+      claim.argument_warnings = [];
+      if (warningPkgIds.size > 0) {
+        const warningHits = (claim.trace.triggered_constraints || []).filter(t => warningPkgIds.has(t.package_id));
+        claim.argument_warnings = warningHits.map(t => ({
+          constraint_id: t.constraint.id,
+          package_id: t.package_id,
+          rule: t.constraint.rule || '',
+          repair: t.constraint.repair || ''
+        }));
+        claim.warning_level = warningHits.length >= 2 ? 'moderate' : (warningHits.length === 1 ? 'minor' : 'none');
+      }
+
+      if (selectedPkgIds.size > 0) {
+        claim.field_filtered_trace = filteredTrace;
+        claim.mechanical_verdict_before_field_filter = claim.verdict;
+        claim.mechanical_triggered_constraints_before_field_filter = claim.triggered_constraints.slice();
+        const detailed = classifyClaimSentenceDetailed(claim.sentence, filteredTrace);
+        claim.verdict = detailed.verdict;
+        claim.verdict_debug = detailed.verdict_debug;
+        claim.display_status = claimDisplayStatus(claim.verdict, filteredTrace, detailed.verdict_debug);
+        claim.frame_fit = detailed.verdict_debug.frame_fit;
+        claim.triggered_constraints = filteredTrace.triggered_constraints.map(t => t.constraint.id);
+        claim.suggested_repair = suggestedClaimRepair(claim.verdict, filteredTrace);
+      }
+    } catch (e) {
+      errors.push({ sentence: claim.sentence, error: e.message });
+    }
+  }));
+  const refreshed = buildSolidityAppraisalRecord(appraisal.input, appraisal.claims);
+  Object.assign(appraisal, refreshed);
+  appraisal.has_field_routing = true;
+  appraisal.field_routing_errors = errors;
+  return appraisal;
+}
+
 // LLM extraction wrapper. Returns either a successful extraction record or
 // throws so the caller can fall back to mechanical splitting.
 async function runLLMClaimExtraction(text, providerConfig) {
@@ -3904,6 +4474,7 @@ function renderSolidityAppraisal(appraisal, repairedText = null) {
           <div style="font-size:12px; color:var(--ink-soft); margin-top:4px;">Support verdict: <code>${escapeHtml(c.display_status?.support_verdict || 'unknown')}</code></div>
           <div style="font-size:12px; color:var(--ink-soft); margin-top:4px;">Frame fit: <code>${escapeHtml(c.display_status?.frame_fit || frameFitStatusLabel(c.frame_fit?.frame_fit_status))}</code>${c.frame_fit?.reason ? ` — ${escapeHtml(c.frame_fit.reason)}` : ''}</div>
           <div style="font-size:12px; color:var(--ink-soft); margin-top:4px;">Caveat status: <code>${escapeHtml(c.display_status?.caveat_status || 'unknown')}</code></div>
+          ${renderClaimFieldRoutingCell(c)}
           ${renderConstraintRelevanceCell(c)}
           ${renderVerdictDebug(c.verdict_debug)}
         </td>
@@ -4130,7 +4701,7 @@ function isStickySafetyConstraint(constraintHit) {
 }
 
 function buildConstraintRelevancePrompt(sentence, sentenceAppraisal) {
-  const trace = sentenceAppraisal.trace || {};
+  const trace = sentenceAppraisal.field_filtered_trace || sentenceAppraisal.trace || {};
   const primary = sentenceAppraisal.primary_frame;
   const primaryId = primary ? primary.package_id : null;
   const constraintsBlock = (trace.triggered_constraints || []).map(t => {
@@ -4196,7 +4767,8 @@ The other two lists are arrays of {constraint_id, reason} objects.`;
 
 function validateConstraintRelevanceFilter(filterResult, sentenceAppraisal) {
   const warnings = [];
-  const triggered = (sentenceAppraisal.trace && sentenceAppraisal.trace.triggered_constraints) || [];
+  const sourceTrace = sentenceAppraisal.field_filtered_trace || sentenceAppraisal.trace || {};
+  const triggered = sourceTrace.triggered_constraints || [];
   const constraintIndex = new Map(triggered.map(t => [t.constraint.id, t]));
   const primaryPkgId = sentenceAppraisal.primary_frame ? sentenceAppraisal.primary_frame.package_id : null;
   const seen = new Set();
@@ -4286,8 +4858,9 @@ function validateConstraintRelevanceFilter(filterResult, sentenceAppraisal) {
 // preserving the original mechanical fields under mechanical_*.
 function applyConstraintRelevanceToClaim(claim, validatedFilter) {
   const ignoredIds = new Set((validatedFilter.ignored_lexical_constraints || []).map(e => e.constraint_id));
-  const filteredTrace = Object.assign({}, claim.trace, {
-    triggered_constraints: (claim.trace.triggered_constraints || []).filter(t => !ignoredIds.has(t.constraint.id))
+  const sourceTrace = claim.field_filtered_trace || claim.trace;
+  const filteredTrace = Object.assign({}, sourceTrace, {
+    triggered_constraints: (sourceTrace.triggered_constraints || []).filter(t => !ignoredIds.has(t.constraint.id))
   });
   const detailed = classifyClaimSentenceDetailed(claim.sentence, filteredTrace);
   const verdict = detailed.verdict;
@@ -4353,6 +4926,30 @@ function renderSoliditySummaryCard(summaryText) {
   `;
   attachCitationHandlers(div);
   return div;
+}
+
+function renderClaimFieldRoutingCell(claim) {
+  if (!claim.field_reading && !claim.support_depth) return '';
+  const fr = claim.field_reading || {};
+  const primary = (fr.primary_fields || []).map(f => f.field).join(', ') || 'none';
+  const pkgs = (fr.candidate_packages || []).map(p => `${p.package_id} (${p.role})`).join(', ') || 'none';
+  const depth = claim.support_depth?.support_depth || 'not_computed';
+  const warning = claim.warning_level && claim.warning_level !== 'none'
+    ? `<div style="font-size:12px; color:var(--warn); margin-top:4px;">Argument warning: <code>${escapeHtml(claim.warning_level)}</code></div>`
+    : '';
+  return `
+    <details style="margin-top:8px;">
+      <summary>Field-first routing</summary>
+      <div style="font-size:12px; color:var(--ink-soft); margin-top:6px;">
+        <div>Text type: <code>${escapeHtml(fr.text_type || '—')}</code></div>
+        <div>Primary fields: ${escapeHtml(primary)}</div>
+        <div>Candidate packages: ${escapeHtml(pkgs)}</div>
+        <div>Support depth: <code>${escapeHtml(depth)}</code></div>
+        <div>${escapeHtml(claim.support_depth?.diagnosis || '')}</div>
+        ${warning}
+      </div>
+    </details>
+  `;
 }
 
 // ============================================================================
@@ -4956,11 +5553,39 @@ function getSelectedProviderConfig() {
   };
 }
 
+function providerKeyExists() {
+  return !!getSelectedProviderConfig().apiKey;
+}
+
+function fieldRoutingCheckboxes() {
+  return [
+    document.getElementById('use-llm-field-routing'),
+    document.getElementById('ask-use-llm-field-routing')
+  ].filter(Boolean);
+}
+
+function isLLMFieldRoutingEnabled() {
+  const mode = renderModeInputs();
+  const checkbox = mode === 'ask'
+    ? document.getElementById('ask-use-llm-field-routing')
+    : document.getElementById('use-llm-field-routing');
+  return !!(checkbox && checkbox.checked && providerKeyExists());
+}
+
+function syncFieldRoutingOptionDefaults() {
+  const hasKey = providerKeyExists();
+  for (const cb of fieldRoutingCheckboxes()) {
+    if (!cb.dataset.userTouched) cb.checked = hasKey;
+    cb.disabled = !hasKey;
+  }
+}
+
 function syncProviderPanels() {
   const { provider } = getSelectedProviderConfig();
   for (const panel of document.querySelectorAll('.api-provider-panel')) {
     panel.classList.toggle('active', panel.dataset.providerPanel === provider);
   }
+  syncFieldRoutingOptionDefaults();
 }
 
 // ---------------------------------------------------------------------------
@@ -4999,7 +5624,7 @@ async function runQuery() {
     out.innerHTML = '';
     out.appendChild(renderSmallErrorCard(
       'LLM-guided TCog-R unavailable',
-      `Add a ${providerConfig.label} API key to use the LLM-guided pipeline. Showing Mechanical only output instead.`
+      `Mechanical routing is being used. Add a ${providerConfig.label} provider key to use LLM field routing and the LLM-guided pipeline.`
     ));
     const summary = renderAnswerSummaryCard(query, trace, sections);
     out.appendChild(renderFrameRolesCard(trace));
@@ -5099,6 +5724,9 @@ async function runAnswerComparison() {
   // Surface the LLM-guided pipeline trace below the comparison card so the
   // vanilla answer can be checked against the actual selection / gate result.
   if (guidedResult.candidatePayload) {
+    if (guidedResult.fieldReading) {
+      out.appendChild(renderFieldRoutingTrace(guidedResult.fieldReading, guidedResult.supportDepth || guidedResult.gatedResult?.support_depth));
+    }
     if (guidedResult.validatedSelection) {
       out.appendChild(renderSelectionCard(guidedResult.validatedSelection, guidedResult.candidatePayload));
     }
@@ -5226,6 +5854,29 @@ async function runClaimAppraisal() {
     }
   }
 
+  if (document.getElementById('use-llm-field-routing')?.checked) {
+    if (providerConfig.apiKey) {
+      const out = document.getElementById('output');
+      out.innerHTML = `<div class="empty-state"><div class="marks">...</div><div class="loading-dots">Reading fields with ${escapeHtml(providerConfig.label)}</div></div>`;
+      try {
+        await addFieldRoutingToAppraisal(appraisal, providerConfig);
+        if (appraisal.field_routing_errors && appraisal.field_routing_errors.length) {
+          extractionNotice = extractionNotice || {
+            title: 'LLM field routing — partial',
+            message: `Some claims could not be field-routed: ${appraisal.field_routing_errors.map(e => e.error).join(' | ')}`
+          };
+        }
+      } catch (e) {
+        extractionNotice = extractionNotice || { title: 'LLM field routing unavailable', message: e.message };
+      }
+    } else {
+      extractionNotice = extractionNotice || {
+        title: 'Mechanical routing in use',
+        message: 'Mechanical routing is being used. Add a provider key to use LLM field routing.'
+      };
+    }
+  }
+
   LAST_APPRAISAL = appraisal;
   LAST_SOLIDITY_SUMMARY = null;
   LAST_SOLIDITY_SUMMARY_WARNINGS = [];
@@ -5290,6 +5941,7 @@ function setActiveMode(mode) {
   const out = document.getElementById('output');
   out.innerHTML = `<div class="empty-state"><div class="marks">→ → →</div>${escapeHtml(modeIntroText(mode))}</div>`;
   resetPipeline();
+  syncFieldRoutingOptionDefaults();
   updateRepairedDraftButton();
 }
 
@@ -5467,6 +6119,12 @@ for (const tab of document.querySelectorAll('input[name="api-provider"]')) {
 }
 syncProviderPanels();
 
+for (const cb of fieldRoutingCheckboxes()) {
+  cb.addEventListener('change', () => {
+    cb.dataset.userTouched = 'true';
+  });
+}
+
 for (const tab of document.querySelectorAll('input[name="workflow-mode"]')) {
   tab.addEventListener('change', () => setActiveMode(tab.value));
 }
@@ -5479,7 +6137,10 @@ document.getElementById('draft-repaired').addEventListener('click', draftRepaire
 document.getElementById('flat-baseline').addEventListener('click', runFlatBaseline);
 document.getElementById('audit-draft').addEventListener('click', runDraftAudit);
 for (const input of document.querySelectorAll('.api-key-input')) {
-  input.addEventListener('input', updateRepairedDraftButton);
+  input.addEventListener('input', () => {
+    syncFieldRoutingOptionDefaults();
+    updateRepairedDraftButton();
+  });
 }
 function clearActiveMode() {
   const mode = renderModeInputs();
@@ -5536,6 +6197,41 @@ for (const chip of document.querySelectorAll('.example-chip')) {
 // and cross-package tests, so they are guaranteed to exercise something
 // real about the architecture.
 const SCENARIOS = [
+  {
+    group: 'Field-first routing regressions',
+    items: [
+      {
+        label: 'field route: machine learning definition',
+        query: 'What is machine learning?',
+        mode: 'ask',
+        llmGuided: true,
+        requires: ['ml_core'],
+        watch: 'With a provider key and Use LLM field routing enabled, primary field should be machine_learning and ml_core should appear as a field-routed candidate. If no cluster fires, support depth should be package_candidate_no_cluster rather than a generic coverage gap.'
+      },
+      {
+        label: 'field route: probability distribution',
+        query: 'What is a probability distribution?',
+        mode: 'ask',
+        llmGuided: true,
+        requires: ['probability_stats_core'],
+        watch: 'Primary field should be probability/statistics/math. If probability_stats_core is missing, support depth should be field_recognized_no_package; if loaded but no cluster fires, package_candidate_no_cluster.'
+      },
+      {
+        label: 'field route: ML claim no cross-frame conflict',
+        query: 'Machine learning is an approach to producing a decision rule or prediction function when the target solution is unknown.',
+        mode: 'solidity',
+        requires: ['ml_core'],
+        watch: 'Primary field should be machine_learning. Political science / biology / other lexical matches should not become cross-frame conflicts unless selected by field routing and relevance filtering.'
+      },
+      {
+        label: 'field route: AI leadership argument warning',
+        query: 'AI makes leaders unnecessary because AI can answer questions faster than humans.',
+        mode: 'solidity',
+        requires: ['management_execution_core'],
+        watch: 'Fields may include AI, management, and leadership. argument_quality_fallacy_core, if loaded, is advisory by default and should not suppress the domain package verdict; it may add a warning about missing warrant or category shift.'
+      }
+    ]
+  },
   {
     group: 'Solidity appraisal demos',
     items: [
@@ -5729,6 +6425,10 @@ async function runScenarioInMode(sc) {
     await runClaimAppraisal();
   } else {
     document.getElementById('query').value = sc.query;
+    if (sc.llmGuided) {
+      const llmMode = document.querySelector('input[name="mode"][value="llm_guided"]');
+      if (llmMode) llmMode.checked = true;
+    }
     await runQuery();
   }
 }
